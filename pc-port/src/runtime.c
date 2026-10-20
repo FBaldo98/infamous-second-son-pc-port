@@ -484,3 +484,54 @@ int runtime_emulate_tls(EXCEPTION_POINTERS *e) {
     return 0;
 }
 uint64_t runtime_tls_fault_count(void) { return (uint64_t)InterlockedCompareExchange64(&tls_faults, 0, 0); }
+
+// SSE4a (AMD only: the PS4's Jaguar has it, Intel CPUs do not). Guest EXTRQ/INSERTQ raise an
+// illegal instruction on Intel; they are interpreted here on the faulting context, as shadPS4's
+// cpu_patches.cpp does. Register operands only (the forms compilers emit): 66/F2 [REX] 0F 79 /r,
+// 66 [REX] 0F 78 /0 ib ib, F2 [REX] 0F 78 /r ib ib. The upper qword of the destination is
+// undefined in the spec; AMD CPUs zero it, and so does this.
+static volatile LONG64 sse4a_emulated;
+static uint64_t sse4a_field_mask(unsigned length) { return length ? (UINT64_C(1) << length) - 1 : ~UINT64_C(0); }
+int runtime_emulate_sse4a(EXCEPTION_POINTERS *e) {
+    CONTEXT *c = e->ContextRecord;
+    if (e->ExceptionRecord->ExceptionCode != EXCEPTION_ILLEGAL_INSTRUCTION || !source_image ||
+        c->Rip < (uintptr_t)source_image || c->Rip - (uintptr_t)source_image >= source_size) return 0;
+    const uint64_t left = source_size - (c->Rip - (uintptr_t)source_image);
+    const unsigned char *at = (const unsigned char *)(uintptr_t)c->Rip;
+    if (left < 4 || (at[0] != 0x66 && at[0] != 0xf2)) return 0;
+    unsigned n = 1, rex = 0;
+    if ((at[n] & 0xf0) == 0x40) rex = at[n++];
+    if (left < n + 3 || at[n] != 0x0f || (at[n + 1] != 0x78 && at[n + 1] != 0x79)) return 0;
+    const int immediate = at[n + 1] == 0x78, insert = at[0] == 0xf2;
+    const unsigned modrm = at[n + 2];
+    if ((modrm >> 6) != 3) return 0;
+    const unsigned reg = ((rex >> 2) & 1) << 3 | ((modrm >> 3) & 7), rm = (rex & 1) << 3 | (modrm & 7);
+    n += 3;
+    if (immediate && (left < n + 2 || (!insert && ((modrm >> 3) & 7)))) return 0;
+    M128A *xmm = c->FltSave.XmmRegisters;
+    if (!insert) {
+        // EXTRQ: the immediate form works on xmm(rm) alone; the register form takes the field
+        // from xmm(rm) bits 5:0 (length) and 13:8 (index) and works on xmm(reg).
+        const unsigned dst = immediate ? rm : reg;
+        const unsigned length = immediate ? at[n] & 0x3f : xmm[rm].Low & 0x3f;
+        const unsigned index = immediate ? at[n + 1] & 0x3f : (xmm[rm].Low >> 8) & 0x3f;
+        xmm[dst].Low = (uint64_t)(xmm[dst].Low >> index) & sse4a_field_mask(length);
+        xmm[dst].High = 0;
+    } else {
+        // INSERTQ: the low length bits of xmm(rm) go to bit index of xmm(reg); the register form
+        // takes the field from xmm(rm) bits 69:64 (length) and 77:72 (index).
+        const uint64_t field = (uint64_t)xmm[rm].High;
+        const unsigned length = immediate ? at[n] & 0x3f : field & 0x3f;
+        const unsigned index = immediate ? at[n + 1] & 0x3f : (field >> 8) & 0x3f;
+        const uint64_t mask = sse4a_field_mask(length);
+        const uint64_t source = (uint64_t)xmm[rm].Low & mask;
+        xmm[reg].Low = ((uint64_t)xmm[reg].Low & ~(mask << index)) | source << index;
+        xmm[reg].High = 0;
+    }
+    const uint64_t site = c->Rip;
+    c->Rip += n + (immediate ? 2 : 0);
+    const LONG64 count = InterlockedIncrement64(&sse4a_emulated);
+    if ((count & (count - 1)) == 0)
+        fprintf(stderr, "SSE4A_EMULATED count=%lld site=0x%llx\n", (long long)count, (unsigned long long)site);
+    return 1;
+}

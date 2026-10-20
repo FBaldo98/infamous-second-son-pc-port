@@ -17,6 +17,7 @@ void runtime_tls_detach(void);
 uintptr_t runtime_resolve(const char *identity, int data);
 int runtime_emulate_tls(EXCEPTION_POINTERS *exception);
 uint64_t runtime_tls_fault_count(void);
+int runtime_emulate_sse4a(EXCEPTION_POINTERS *exception);
 uintptr_t sync_resolve(const char *identity);
 uintptr_t thread_resolve(const char *identity);
 uintptr_t time_resolve(const char *identity);

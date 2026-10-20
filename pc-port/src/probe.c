@@ -74,6 +74,7 @@ static LONG CALLBACK fault(EXCEPTION_POINTERS *exception) {
        exception_code!=EXCEPTION_STACK_OVERFLOW && exception_code!=EXCEPTION_INT_DIVIDE_BY_ZERO &&
        exception_code!=EXCEPTION_PRIV_INSTRUCTION)return EXCEPTION_CONTINUE_SEARCH;
     if (runtime_emulate_tls(exception)) return EXCEPTION_CONTINUE_EXECUTION;
+    if (runtime_emulate_sse4a(exception)) return EXCEPTION_CONTINUE_EXECUTION;
     if (gpu_handle_fault(exception)) return EXCEPTION_CONTINUE_EXECUTION;
     uintptr_t address = (uintptr_t)exception->ExceptionRecord->ExceptionAddress;
     uintptr_t accessed = 0;
