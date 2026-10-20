@@ -17,6 +17,8 @@
 /tools/
 
 # Local data and leftovers
+# Game dump (Sony): never commit or push
+/CUSA00004/
 /SaveBackup/
 /sandbox/
 /pc-port/evidence/
