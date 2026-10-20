@@ -563,6 +563,9 @@ static int cpu_has_sse4a(void) {
     __cpuid(r, (int)0x80000001);
     return (r[2] >> 6) & 1;
 }
+// The guest EXTRQ/INSERTQ sites run as they are when the host has SSE4a (AMD CPUs); only CPUs
+// without it (Intel) get the trampolines and the trap emulation.
+int runtime_has_sse4a(void) { return cpu_has_sse4a(); }
 // EXTRQ xmm, xmm at p: 66 [REX.R/B] 0F 79 modrm(mod=3). Returns its length or 0.
 static unsigned sse4a_extrq_reg(const unsigned char *p, unsigned *dst, unsigned *src) {
     unsigned n = 1, rex = 0;
@@ -602,7 +605,13 @@ static unsigned char *sse4a_emit_extrq(unsigned char *p, unsigned dst, unsigned 
 void runtime_patch_sse4a(const uint64_t *segment_addresses, const uint64_t *segment_sizes, uint64_t count) {
     char value[8] = {0};
     GetEnvironmentVariableA("ISS_SSE4A_PATCH", value, sizeof(value));
-    if (!source_image || value[0] == '0' || cpu_has_sse4a()) return;
+    if (!source_image) return;
+    if (cpu_has_sse4a()) {
+        // Native: the host executes the guest's SSE4a instructions; no trampolines, no traps.
+        fprintf(stderr, "SSE4A_NATIVE (CPU has SSE4a; guest instructions run as they are)\n");
+        return;
+    }
+    if (value[0] == '0') return;
     ZydisDecoder decoder;
     ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
     static Sse4aSite sites[SSE4A_MAX_SITES];
