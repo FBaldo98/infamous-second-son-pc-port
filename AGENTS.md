@@ -1,11 +1,11 @@
 # AGENTS.md: working on the `intel-support` branch
 
-Notes for agents (and people) continuing this work. Upstream (`origin`, Castlesea) was developed and tested on a **Ryzen 7 7800X3D + Radeon RX 9070 XT (16 GB)**. This branch makes the port run on an **Intel i7-12650H (hybrid, no SSE4a) + RTX 3050 Ti Laptop (4 GB)**, 32 GB RAM, Windows 11. Read `README.md` and `pc-port/ARCHITECTURE.md` for how the port itself works.
+Notes for agents (and people) continuing this work. Upstream (Castlesea) was developed and tested on a **Ryzen 7 7800X3D + Radeon RX 9070 XT (16 GB)**. This branch makes the port run on an **Intel i7-12650H (hybrid, no SSE4a) + NVIDIA**, 32 GB RAM, Windows 11; the original target was an **RTX 3050 Ti Laptop (4 GB)**, and the current test GPU is an **RTX 5090 (32 GB)**. Read `README.md` and `pc-port/ARCHITECTURE.md` for how the port itself works.
 
 ## Rules
 
-- **Never commit or push the game.** `CUSA00004/` (the user's PS4 dump) is listed in `.git/info/exclude`. Stage files by explicit path, never `git add -A` / `git add .`. Game-derived data (`pc-port/out/`, prepared images, shader caches, saves, logs) is git-ignored and stays local.
-- Remotes: `fork` = FBaldo98/infamous-second-son-pc-port (push here), `origin` = Castlesea upstream (do not push). Work happens on `intel-support`; `main` on the fork only has the build-script fixes.
+- **Never commit or push the game.** `CUSA00004/` (the user's PS4 dump) is in `.gitignore` (and `.git/info/exclude`). Stage files by explicit path, never `git add -A` / `git add .`. Game-derived data (`pc-port/out/`, prepared images, shader caches, saves, logs) is git-ignored and stays local.
+- Remotes: `origin` = FBaldo98/infamous-second-son-pc-port (the fork; push here). Upstream Castlesea is not a remote in this clone. This checkout works on `main`; `intel-support` is one commit behind it.
 - Commits end with the `Co-Authored-By` line the session asks for.
 
 ## Build environment (this machine)
@@ -27,7 +27,8 @@ Build order: `prepare.py --game <dir>`, `link_modules.py --game <dir>`, `build.p
 
 ## Running and debugging
 
-- Run folder: `pc-port/out/run/` = `inFAMOUS Second Son Launcher.exe` + `bin/` (`iss-probe.exe`, `iss-gpu.dll`, `SDL3.dll`) + `assets/fonts/` + `user/` (`launcher.ini` with `game_dir=`, `prepared/`, `saves/`, `shader-cache/`, `logs/<timestamp>/`). After each build, copy the binaries into `run/bin/`. The launcher has no autoplay; the user presses PLAY. It strips `ISS_*` variables from its environment, so tuning needs code or `kGameEnvironment` changes.
+- Run folder: `pc-port/out/local-play/` on this machine (`out/run/` is the author's release folder) = `inFAMOUS Second Son Launcher.exe` + `bin/` (`iss-probe.exe`, `iss-gpu.dll`, `SDL3.dll`) + `assets/fonts/` + `user/` (`launcher.ini` with `game_dir=`, `prepared/`, `saves/`, `shader-cache/`, `logs/<timestamp>/`). After each build, copy the binaries into `local-play/bin/`. The launcher has no autoplay; the user presses PLAY. It strips `ISS_*` variables from its environment, so tuning needs code or `kGameEnvironment` changes.
+- From the repo root, `play.cmd` (a wrapper for `play.ps1`) starts that launcher, waits for its window and sends Enter for PLAY; `-LauncherOnly` opens the launcher without starting the session. It exits if `iss-probe` is already running.
 - Each session writes `stdout.log`, `stderr.log` and `frames.csv` (per-frame timings). stderr is buffered: lines appear in full only after the game exits.
 - Wait for a session: poll `tasklist` for `iss-probe.exe` start and exit.
 - **Hangs**: `C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe -pv -p <pid> -c "!runaway 3; ~*kn 25; qd"` dumps every thread non-invasively. `iss-gpu.dll` has no PDB: convert `export+offset` to an RVA with `llvm-readobj --coff-exports`, then look the RVA up in `pc-port/out/iss-gpu.map` (preferred load address 0x180000000).
@@ -72,11 +73,27 @@ Also on this branch: `ISS_GC_CRITICAL_SPARE_TICKS` (aggressive texture GC spares
 - Conclusion: the next step is an engine-side materialization of the draw's buffers (a staging/arena copy the recorder can bind), not host import. Deferred template drops (`NativeMaterial::RequestDrop`) now keep the material table command-processor-only.
 - 5 of 12 scripted sessions crashed at `nvoglv64.dll+0xde3240/0xde3281` at 814-894 frames (world load); one of them used the pre-change DLL, so it is not the drop queue, but the dead-view window is not fully closed. The 15:38 DLL survived the same route in its other runs, so this is intermittent.
 
+## Volumetric light-shaft flicker (2026-10-21)
+
+On the RTX 5090 the volumetric light shafts flicker (the sunbeam through the window in the Akomee room; first reported as flickering smoke/particles). They still flicker at 60 FPS. DXGI captures of the game window (`ddagrab`, 60 fps) and per-pixel temporal statistics isolate it: the shaft's mean brightness has std 0.96-2.71 and a frame-to-frame delta of 1.2-3.5, with peaks at 6-15.5 Hz, while a static wall and the idle player stay below 0.1. It is a real temporal modulation of the shaft, not camera motion or the particle simulation.
+
+Ruled out, each with a game-window capture:
+
+- `ISS_NATIVE_COMPUTE_PS4_ORDER=0` (compute barriers): 13.6M barriers inserted instead of 0, no change. The vendor-gated default and DLL were reverted; the baseline `iss-gpu.dll` is the 19:47 build.
+- `ISS_REAL_OCCLUSION=0`: the 6 Hz peak dropped (std 1.13 -> 0.96) but the shaft still flickers. Not the cause.
+- `ISS_RENDER_REUSE=0`: still flickers (beam std 2.11; 7.5/10/15.5 Hz).
+- 60 FPS cap (`fps_limit=60`): still flickers; not simply the 144 Hz frame rate.
+
+The same flicker-test session (`20261020-231016`) ended with `HOST_EXCEPTION_PASSED code=0xc0000005 nvoglv64.dll+0xdac7c0` after `NATIVE_PASSES_DEAD_VIEW count=2` and `count=4`; that is the open dead-view window (open work 1), not proven related to the flicker.
+
+Next suspects: the shaft's own shader/temporal noise (dither, blue noise or a history buffer), a native-vs-full draw-path difference for the shaft, or an NVIDIA filtering/precision difference. `ddagrab` samples a 144 FPS game at 60 fps and `ISS_CAPTURE_FRAMES`/`ISS_VISUAL_SEQUENCE` only take a few frames hundreds of ms apart, so a frame-accurate capture or a `PTRACE` filtered to the shaft draw is the next diagnostic. The captures and analysis scripts are in `pc-port/out/flicker-captures/` (git-ignored).
+
 ## Open work
 
-1. **Verify the dead-view check** (commit 3eb8b94) in a long session: no `PUSH_DESCRIPTOR_FAULT`, no host fault, no freeze.
+1. **Verify the dead-view check** (commit 3eb8b94) in a long session: no `PUSH_DESCRIPTOR_FAULT`, no host fault, no freeze. The 2026-10-20 session still ended in `nvoglv64.dll+0xdac7c0` after two `NATIVE_PASSES_DEAD_VIEW` reports.
 2. **Performance**: the game is bound by the command processor (frame time tracks `command_processor_ms`; cost per draw is constant, frame time rises with draw count, ~2000 to ~5400 draws per frame). `readback_stall_ms` is also large. This is upstream's next roadmap item.
-3. **VRAM on 4 GB**: usage sits ~3.5 GB over a 3.37 GB budget, the texture GC deletes tens of thousands of textures per session (re-uploads). Unverified lead: the 512 MB unified-memory region (memory type 3) may live in VRAM through ReBAR.
+3. **VRAM on the 4 GB laptop**: usage sits ~3.5 GB over a 3.37 GB budget, the texture GC deletes tens of thousands of textures per session (re-uploads). Unverified lead: the 512 MB unified-memory region (memory type 3) may live in VRAM through ReBAR.
 4. **Release packaging** without the author's folders: parametrize `build_release.py` on `pc-port/out` binaries; shader recipes are optional (the shader cache now persists between clean sessions and compile time is ~1 s per session).
 5. 7 red-zone memory accesses are unrelocatable (left unprotected).
 6. Old autosaves from the early crashed sessions are in `pc-port/out/run/user/saves.bak-20261020-1148` (not the cause of any crash; can be deleted).
+7. **Volumetric light-shaft flicker** (RTX 5090): a ~6-15 Hz brightness modulation isolated to the shaft; compute barriers, real occlusion, render reuse and 60 FPS are ruled out. See the section above.
