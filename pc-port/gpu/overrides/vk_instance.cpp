@@ -8,6 +8,7 @@
 
 #include "common/assert.h"
 #include "common/debug.h"
+#include "handle_registry.h"
 #include "common/types.h"
 #include "imgui/renderer/imgui_core.h"
 #include "sdl_window.h"
@@ -708,6 +709,7 @@ bool Instance::CreateDevice() {
     device = std::move(dev);
 
     VULKAN_HPP_DEFAULT_DISPATCHER.init(*device);
+    iss::handles::Install(); // image view and sampler lifetimes for fault reports
     iss::native_geometry::RegisterIndirectFirstInstanceFeature(
         *this, request_indirect_first_instance && features.drawIndirectFirstInstance);
     if (request_indirect_first_instance && features.drawIndirectFirstInstance) {

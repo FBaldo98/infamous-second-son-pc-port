@@ -572,19 +572,38 @@ void IssPinCommandProcessor() {
         std::fprintf(stderr, "PORT_TUNING cp_cpu failed: no CPU set information\n");
         return;
     }
-    struct Set { ULONG id; unsigned core; unsigned logical; unsigned group; };
+    struct Set { ULONG id; unsigned core; unsigned logical; unsigned group; unsigned efficiency; };
     std::vector<Set> sets;
+    unsigned fastest = 0;
     for (size_t offset = 0; offset < length;) {
         const auto* info = reinterpret_cast<const SYSTEM_CPU_SET_INFORMATION*>(buffer.data() + offset);
         if (info->Type == CpuSetInformation) {
             sets.push_back({info->CpuSet.Id, info->CpuSet.CoreIndex,
-                            info->CpuSet.LogicalProcessorIndex, info->CpuSet.Group});
+                            info->CpuSet.LogicalProcessorIndex, info->CpuSet.Group,
+                            info->CpuSet.EfficiencyClass});
+            fastest = std::max<unsigned>(fastest, info->CpuSet.EfficiencyClass);
         }
         offset += info->Size;
     }
     const Set* mine = nullptr;
     for (const auto& set : sets) {
         if (set.group == 0 && set.logical == wanted) mine = &set;
+    }
+    // iss: on hybrid CPUs (Intel 12th gen and later) the default logical processor can be an
+    // efficiency core: 14 is one on an i7-12650H, where the command processor then set the frame
+    // rate from the slowest kind of core. "auto", or a processor slower than the fastest class,
+    // takes the first logical processor of the last fastest-class core instead.
+    if (!std::strcmp(value, "auto") || (mine && mine->efficiency < fastest)) {
+        const Set* best = nullptr;
+        for (const auto& set : sets)
+            if (set.group == 0 && set.efficiency == fastest &&
+                (!best || set.core > best->core || (set.core == best->core && set.logical < best->logical)))
+                best = &set;
+        if (best && best != mine) {
+            std::fprintf(stderr, "PORT_TUNING cp_cpu %s -> logical %u (core %u, efficiency class %u of %u)\n",
+                         value, best->logical, best->core, best->efficiency, fastest);
+            mine = best;
+        }
     }
     if (!mine) {
         std::fprintf(stderr, "PORT_TUNING cp_cpu failed: logical processor %ld not found\n", wanted);
@@ -598,6 +617,6 @@ void IssPinCommandProcessor() {
         SetProcessDefaultCpuSets(GetCurrentProcess(), others.data(), static_cast<ULONG>(others.size()));
     const ULONG id = mine->id;
     const BOOL thread_ok = SetThreadSelectedCpuSets(GetCurrentThread(), &id, 1);
-    std::fprintf(stderr, "PORT_TUNING cp_cpu=%ld core=%u process_default=%d(%zu sets) thread=%d\n",
-                 wanted, unsigned(mine->core), int(process_ok), others.size(), int(thread_ok));
+    std::fprintf(stderr, "PORT_TUNING cp_cpu=%u core=%u process_default=%d(%zu sets) thread=%d\n",
+                 mine->logical, unsigned(mine->core), int(process_ok), others.size(), int(thread_ok));
 }

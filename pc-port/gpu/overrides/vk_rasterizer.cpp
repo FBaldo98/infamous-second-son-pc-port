@@ -1,6 +1,7 @@
 #include <shared_mutex>
 #include <algorithm>
 #include <execution>
+#include "handle_registry.h"
 #include "native_item_identity.h"
 #include "repeat_census.h"
 #include "unified_memory.h"

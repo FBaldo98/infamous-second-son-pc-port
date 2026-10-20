@@ -914,6 +914,14 @@ static bool GuardedPushDescriptors(VkCommandBuffer cmd, VkPipelineLayout layout,
         return false;
     }
 }
+static bool GuardedUpdateDescriptors(VkDevice device, u32 count, const VkWriteDescriptorSet* writes) {
+    __try {
+        VULKAN_HPP_DEFAULT_DISPATCHER.vkUpdateDescriptorSets(device, count, writes, 0, nullptr);
+        return true;
+    } __except (1) {
+        return false;
+    }
+}
 static bool GuardedRead(const void* address, void* out, size_t bytes) {
     __try {
         std::memcpy(out, address, bytes);
@@ -940,9 +948,13 @@ static void ReportPushFault(u64 vs_hash, u64 fs_hash, const VkWriteDescriptorSet
             } else if (w.pImageInfo) {
                 VkDescriptorImageInfo im{};
                 const bool ok = GuardedRead(w.pImageInfo + e, &im, sizeof(im));
-                std::fprintf(stderr, "  write=%u binding=%u type=%d view=0x%llx sampler=0x%llx layout=%d%s\n", i,
+                char view_state[64], sampler_state[64];
+                std::fprintf(stderr, "  write=%u binding=%u type=%d view=0x%llx [%s] sampler=0x%llx [%s] layout=%d%s\n", i,
                              w.dstBinding, int(w.descriptorType), (unsigned long long)(uintptr_t)im.imageView,
-                             (unsigned long long)(uintptr_t)im.sampler, int(im.imageLayout), ok ? "" : " (unreadable)");
+                             iss::handles::DescribeView(u64(uintptr_t(im.imageView)), view_state, sizeof(view_state)),
+                             (unsigned long long)(uintptr_t)im.sampler,
+                             iss::handles::DescribeSampler(u64(uintptr_t(im.sampler)), sampler_state, sizeof(sampler_state)),
+                             int(im.imageLayout), ok ? "" : " (unreadable)");
             } else if (w.pTexelBufferView) {
                 std::fprintf(stderr, "  write=%u binding=%u type=%d texel_view_ptr=%p\n", i, w.dstBinding,
                              int(w.descriptorType), (const void*)w.pTexelBufferView);
@@ -1219,6 +1231,22 @@ static np::DrawResult Record(np::Segment& s, void* regs_ptr, u64 key, const u32*
         push.buf_offsets[slot.binding] = u8(offset - aligned);
         info = vk::DescriptorBufferInfo{handle, aligned, bound + (offset - aligned)};
     }
+    // iss: the template's textures are validated (TexturesValid) on the command processor when
+    // the recorded segment executes, after this push. A template holding a view destroyed since
+    // it was learned was pushed here first: the NVIDIA driver reads the view object at the push
+    // and faulted on the freed memory (AMD's does not, the recording was discarded). Views known
+    // to be destroyed send the draw to the full path; the segment's validation drops the template.
+    for (const auto& write : t->writes) {
+        if (!write.pImageInfo) continue;
+        for (u32 e = 0; e < write.descriptorCount; ++e) {
+            if (!iss::handles::IsLiveView(u64(uintptr_t(VkImageView(write.pImageInfo[e].imageView))))) {
+                static std::atomic<u32> dead_views{};
+                const u32 n = dead_views.fetch_add(1, std::memory_order_relaxed) + 1;
+                if ((n & (n - 1)) == 0) std::fprintf(stderr, "NATIVE_PASSES_DEAD_VIEW count=%u\n", n);
+                return fail(MissCommand);
+            }
+        }
+    }
     NativeMaterial::BuildWrites(*t, infos.data(), writes);
     if (pipeline->UsesPushDescriptors()) {
         const auto* raw = reinterpret_cast<const VkWriteDescriptorSet*>(writes.data());
@@ -1234,7 +1262,13 @@ static np::DrawResult Record(np::Segment& s, void* regs_ptr, u64 key, const u32*
         const auto set = w->AllocateSet(pipeline->GetDescriptorSetLayout(), seq);
         if (!set) return fail(MissPool);
         for (auto& write : writes) write.dstSet = set;
-        w->device.updateDescriptorSets(u32(writes.size()), writes.data(), 0, nullptr);
+        const auto* raw = reinterpret_cast<const VkWriteDescriptorSet*>(writes.data());
+        if (!GuardedUpdateDescriptors(static_cast<VkDevice>(w->device), u32(writes.size()), raw)) {
+            const auto vs = stages[static_cast<u32>(Shader::SwStage::Vertex)];
+            const auto fs = stages[static_cast<u32>(Shader::SwStage::Fragment)];
+            ReportPushFault(vs ? vs->pgm_hash : 0, fs ? fs->pgm_hash : 0, raw, u32(writes.size()));
+            return fail(MissCommand);
+        }
         cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipeline->GetLayout(), 0, 1, &set,
                                0, nullptr);
     }

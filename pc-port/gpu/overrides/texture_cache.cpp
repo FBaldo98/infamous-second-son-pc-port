@@ -1719,6 +1719,14 @@ void TextureCache::RunGarbageCollector() {
 }
 
 void TextureCache::TouchImage(const Image& image) {
+    // iss: an unregistered image already freed its LRU item (UnregisterImage). Touching it
+    // re-linked the free item into the list; reused by the next image, it was linked twice and
+    // the list became a cycle (the collector looped forever holding the cache lock: the game
+    // froze, 2026-10-20). Deleted images stay allocated a while (the graveyard), so this is
+    // reachable through any path that touches images by id.
+    if (False(image.flags & ImageFlagBits::Registered)) {
+        return;
+    }
     const size_t id = image.lru_id;
     if (id < lru_touched.size()) {
         if (lru_touched[id] == gc_tick + 1) {
@@ -1816,6 +1824,13 @@ void TextureCache::DeleteImage(ImageId image_id) {
 }
 
 void TextureCache::ReclaimImage(ImageId image_id) {
+    // iss: native pass and material templates keep the image views they were learned with and
+    // only look at them again when a generation changed. Unregistering bumped the cache
+    // generation while the views were still alive (a template revalidated and kept them); their
+    // destruction later changed nothing, and draws pushed views destroyed seconds before (NVIDIA
+    // driver faults, 2026-10-20). Both generations change before and after the destruction.
+    BumpImageGeneration(image_id);
+    BumpGeneration();
     // Reclaim image and any image views it references.
     scheduler.DeferOperation([this, image_id] {
         Image& image = slot_images[image_id];
@@ -1825,6 +1840,8 @@ void TextureCache::ReclaimImage(ImageId image_id) {
             }
         }
         slot_images.erase(image_id);
+        BumpImageGeneration(image_id);
+        BumpGeneration();
     });
 }
 
