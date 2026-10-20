@@ -11,7 +11,8 @@ from prepare import ROOT, DEFAULT_GAME
 def create():
     game=DEFAULT_GAME.resolve()
     manifest=game/'Project.gp4'
-    paths=[n.get('targ_path') for n in ET.parse(manifest).findall('./files/file')]
+    # Dumps without a GP4 manifest have no declared file list: treat them as complete.
+    paths=[n.get('targ_path') for n in ET.parse(manifest).findall('./files/file')] if manifest.is_file() else []
     missing=[]
     total=0
     for relative in paths:
@@ -36,7 +37,7 @@ def create():
         ids=struct.unpack_from('<'+'H'*count,tables[1],offset)
         if any(idx>=mchunks for idx in ids): raise ValueError('invalid microchunk ID')
         sizes.append(sum(struct.unpack_from('<Q',tables[3],idx*16+8)[0]&0xffffffffffff for idx in ids))
-    report={'manifest':str(manifest),'manifest_sha256':hashlib.sha256(manifest.read_bytes()).hexdigest(),
+    report={'manifest':str(manifest),'manifest_sha256':hashlib.sha256(manifest.read_bytes()).hexdigest() if manifest.is_file() else None,
             'declared_files':len(paths),'present_file_bytes':total,'missing':missing,
             'playgo_sha256':hashlib.sha256(data).hexdigest(),'chunks':chunks,'chunk_sizes':sizes,
             'availability_basis':'All files declared by the local GP4 manifest are present; not an asset hash audit.'}

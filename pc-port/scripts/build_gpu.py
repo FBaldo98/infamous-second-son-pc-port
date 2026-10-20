@@ -48,7 +48,7 @@ def link_command(objects,libraries,dll_output,link_flags):
     return command
 
 def environment():
-    vars=Path(r'C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat')
+    vars=next((p for p in (Path(r'C:\Program Files\Microsoft Visual Studio\2022')/e/'VC/Auxiliary/Build/vcvars64.bat' for e in ('Community','Professional','Enterprise','BuildTools')) if p.exists()),Path(r'C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat'))
     result=subprocess.run(f'cmd.exe /d /s /c ""{vars}" >nul && set"',capture_output=True,text=True,check=True)
     env=os.environ.copy()
     for line in result.stdout.splitlines():

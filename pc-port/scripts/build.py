@@ -10,7 +10,7 @@ import shutil
 import argparse
 
 ROOT = Path(__file__).resolve().parents[1]
-VARS = Path(r'C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat')
+VARS = next((p for p in (Path(r'C:\Program Files\Microsoft Visual Studio\2022')/e/'VC/Auxiliary/Build/vcvars64.bat' for e in ('Community','Professional','Enterprise','BuildTools')) if p.exists()),Path(r'C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat'))
 CLANG = ROOT.parent / 'tools/llvm/bin/clang-cl.exe'
 
 def build(output=None):
@@ -67,6 +67,8 @@ def build(output=None):
         + ''.join('{' + json.dumps(k) + ',' + json.dumps(v) + '},\n' for k, v in sorted(symbols.items()))
         + '};\n', encoding='utf-8')
     cmd = [str(CLANG), '/TC', '/std:c11', '/W4', '/WX', '/O2', '/MD',
+           # Clang 21+ warns on globals that are only written; the runtime keeps such state.
+           '/clang:-Wno-unknown-warning-option', '/clang:-Wno-unused-but-set-global',
            '/clang:-fuse-ld=lld', f'/I{out}', '/D_CRT_SECURE_NO_WARNINGS', '/DZYDIS_STATIC_BUILD', '/DZYCORE_STATIC_BUILD',
            f'/I{ROOT.parent / "research/shadPS4-perf/externals/zydis/include"}',
            f'/I{ROOT.parent / "research/shadPS4-perf/externals/zydis/dependencies/zycore/include"}',
