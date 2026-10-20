@@ -52,6 +52,26 @@ Also on this branch: `ISS_GC_CRITICAL_SPARE_TICKS` (aggressive texture GC spares
 
 `SSE4A_PATCH`, `SSE4A_TRAP`, `SSE4A_EMULATED`, `RED_ZONE`, `RESIDENCY_TYPES`, `RESIDENCY_ALLOC_FAILED` + `MEMORY_HEAP`, `RESIDENCY_SYSMEM`, `HUGE_BUFFER`, `READ_BUFFER_CAP`, `GUEST_FAULT_HANDLED` (first handled fault per guest address), `HOST_EXCEPTION_PASSED`, `PROBE_EVENT host_fault` + `HOST_FAULT_FRAME`, `PUSH_DESCRIPTOR_FAULT`, `NATIVE_PASSES_DEAD_VIEW`, `PORT_TUNING cp_cpu ... -> logical N`.
 
+`ISS_NATIVE_PASSES_RESOLVE=1` logs `NATIVE_PASSES_RESOLVE` every report: why a draw's buffer did not resolve on the engine thread, by guest heap (A/B/C), caller (slot binding/geometry/indirect) and `PeekPublishedArena` reason (`not_resident`, `no_arena`, `mixed_arena`, `no_tick`), with the first 16 failing ranges. It is off by default (hot path).
+
+## Native command processor work (2026-10-20)
+
+- The last full session (`logs/20261020-154425`, 11,272 frames): CP busy 30.0 ms of 34.3 ms per frame, 5,415 draws/frame at ~5.5 µs/draw; 74.6% of frames CP > 20 ms; CP grows 13.3 -> 40.7 ms from <3k to >=7k draws/frame. `recorder_execute` is ~0.1% of CP time; the cost is the translated draws' binds (from `ISS_CP_PATH_CYCLES=1`: `bind_res` 2.1 µs, `draw` 1.75 µs, `bind_tex` 1.4 µs, `bind_vertex` 0.85 µs per call).
+- 83% of recording attempts miss `MissBuffer`. `ISS_NATIVE_PASSES_RESOLVE=1` shows the causes: with the default unified heap (B) no draw buffer is in it; misses are heap A 31% / heap C 69%, and 99% of the arena attempts are `not_resident`. The scan/record runs before the command processor has materialized those arenas, and the small streaming buffers are served by staging copies the recorder cannot see, so arenas never become resident for them. Only ~15% of draws record natively.
+- Host-importing A or C (`ISS_UNIFIED_RANGE=0x80000000:0x20000000` or `0x200000000:0xB8000000`) makes 63-64% of resolves unified and drops `MissBuffer` to 0.5-4.7%, but is a **net loss on this machine**: vertex/index fetches over PCIe, and C also explodes readback waits. `EnableUnified` now imports the contiguous part of a range (heap C's mapping is 0xB7FF0000 of 0xB8000000, a 64 KB gap), which is what made the C test possible.
+
+  Heavy frames (draws >= 2000), scripted autosave, this machine:
+
+  | unified range | unified resolves | MissBuffer | present | CP | readback stall |
+  |---|---|---|---|---|---|
+  | default (B, 512 MB) | 0% | 89% | 33.8 ms | 32.8 ms | 22.8 ms |
+  | B full (1.2 GB) | 0% | 89% | 33.8 ms | 32.8 ms | 22.8 ms |
+  | A (512 MB) | 63% | 12% | 50.2 ms | 20.4 ms | 2.4 ms |
+  | C (2.875 GB) | 64% | 4.7% | 78.3 ms | 27.6 ms | 173 ms |
+
+- Conclusion: the next step is an engine-side materialization of the draw's buffers (a staging/arena copy the recorder can bind), not host import. Deferred template drops (`NativeMaterial::RequestDrop`) now keep the material table command-processor-only.
+- 5 of 12 scripted sessions crashed at `nvoglv64.dll+0xde3240/0xde3281` at 814-894 frames (world load); one of them used the pre-change DLL, so it is not the drop queue, but the dead-view window is not fully closed. The 15:38 DLL survived the same route in its other runs, so this is intermittent.
+
 ## Open work
 
 1. **Verify the dead-view check** (commit 3eb8b94) in a long session: no `PUSH_DESCRIPTOR_FAULT`, no host fault, no freeze.

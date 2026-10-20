@@ -627,6 +627,47 @@ struct EngineStats {
 };
 static EngineStats engine_stats;
 
+// ISS_NATIVE_PASSES_RESOLVE=1 (diagnosis): why a draw's buffer did not resolve on the engine
+// thread (MissBuffer), by the guest heap its base address is in. A range that starts inside the
+// imported heap but runs past its end is its own class: the capped read bindings ("to the end of
+// memory") do that.
+enum ResolveRegion : u32 { ResolveHeapA, ResolveHeapB, ResolveHeapC, ResolveOther,
+                           ResolveUnifiedEnd, ResolveRegionCount };
+constexpr const char* resolve_region_names[ResolveRegionCount] = {"a", "b", "c", "other",
+                                                                  "unified_end"};
+struct ResolveStats {
+    std::array<std::atomic<u64>, ResolveRegionCount> miss{};
+    std::array<std::atomic<u64>, 3> caller{}; // 0 slot binding, 1 geometry, 2 indirect arguments
+    std::array<std::atomic<u64>, 6> arena_reason{}; // VideoCore::BufferCache::ArenaPeek
+    std::atomic<u64> calls{}, unified{}, arena{}, huge{};
+    std::atomic<u64> arena_attempts{};
+    struct Sample {
+        u64 address, size;
+        u32 caller, region;
+    };
+    std::mutex sample_mutex;
+    std::vector<Sample> samples;
+    std::atomic<bool> samples_reported{};
+};
+static ResolveStats resolve_stats;
+
+static bool ResolveDiag() {
+    static const bool enabled = [] {
+        const char* p = std::getenv("ISS_NATIVE_PASSES_RESOLVE");
+        return p && p[0] == '1';
+    }();
+    return enabled;
+}
+
+static u32 ResolveRegionOf(VAddr address) {
+    // The game's direct heaps (src/memory.c): A 512 MB at 0x80000000, B 1.2 GB at 0x20000000,
+    // C 2.875 GB at 0x200000000.
+    if (address >= 0x80000000ull && address < 0xA0000000ull) return ResolveHeapA;
+    if (address >= 0x20000000ull && address < 0x68000000ull) return ResolveHeapB;
+    if (address >= 0x200000000ull && address < 0x2B8000000ull) return ResolveHeapC;
+    return ResolveOther;
+}
+
 // The dynamic state of a draw from its registers, as the command processor's
 // Rasterizer::UpdateDynamicState (viewport/scissor, depth/stencil, primitive, rasterization,
 // color blending; no attachment feedback loop: such draws are not recorded).
@@ -1086,8 +1127,11 @@ static np::DrawResult Record(np::Segment& s, void* regs_ptr, u64 key, const u32*
     auto& cache = *g.buffer_cache;
     const u64 alignment = g.instance->StorageMinAlignment();
     // Resolves a guest range the draw reads: the imported heap or a published arena.
-    const auto resolve = [&](VAddr address, u64 size, vk::Buffer& handle, u64& offset) {
+    const auto resolve = [&](VAddr address, u64 size, vk::Buffer& handle, u64& offset, u32 kind) {
+        const bool diag = ResolveDiag();
+        if (diag) resolve_stats.calls.fetch_add(1, std::memory_order_relaxed);
         if (unified && cache.IsUnified(address, size)) {
+            if (diag) resolve_stats.unified.fetch_add(1, std::memory_order_relaxed);
             handle = unified->Handle();
             offset = address - unified_base;
             if (!r.reads_unified) {
@@ -1105,11 +1149,45 @@ static np::DrawResult Record(np::Segment& s, void* regs_ptr, u64 key, const u32*
             const char* p = std::getenv("ISS_NATIVE_PASSES_NO_ARENA");
             return p && p[0] == '1';
         }();
-        if (no_arena) return false;
+        if (no_arena) {
+            if (diag) {
+                const bool starts_in_unified =
+                    unified && address >= unified_base &&
+                    address < unified_base + iss::unified::RangeSize();
+                const u32 region = starts_in_unified ? ResolveUnifiedEnd : ResolveRegionOf(address);
+                resolve_stats.miss[region].fetch_add(1, std::memory_order_relaxed);
+                resolve_stats.caller[kind].fetch_add(1, std::memory_order_relaxed);
+                if (size >= (64ull << 20)) resolve_stats.huge.fetch_add(1, std::memory_order_relaxed);
+                std::scoped_lock lock{resolve_stats.sample_mutex};
+                if (resolve_stats.samples.size() < 16)
+                    resolve_stats.samples.push_back({address, size, kind, region});
+            }
+            return false;
+        }
         // Read first: an arena created or migrated after it changes the generation.
         const u64 arena_gen = cache.ArenaBindingGeneration();
-        const auto arena = cache.PeekPublishedArena(address, u32(size));
-        if (!arena) return false;
+        VideoCore::BufferCache::ArenaPeek why{};
+        if (diag) resolve_stats.arena_attempts.fetch_add(1, std::memory_order_relaxed);
+        const auto arena = diag ? cache.PeekPublishedArena(address, u32(size), why)
+                                : cache.PeekPublishedArena(address, u32(size));
+        if (!arena) {
+            if (diag) {
+                if (why != VideoCore::BufferCache::ArenaPeek::Ok)
+                    resolve_stats.arena_reason[u32(why)].fetch_add(1, std::memory_order_relaxed);
+                const bool starts_in_unified =
+                    unified && address >= unified_base &&
+                    address < unified_base + iss::unified::RangeSize();
+                const u32 region = starts_in_unified ? ResolveUnifiedEnd : ResolveRegionOf(address);
+                resolve_stats.miss[region].fetch_add(1, std::memory_order_relaxed);
+                resolve_stats.caller[kind].fetch_add(1, std::memory_order_relaxed);
+                if (size >= (64ull << 20)) resolve_stats.huge.fetch_add(1, std::memory_order_relaxed);
+                std::scoped_lock lock{resolve_stats.sample_mutex};
+                if (resolve_stats.samples.size() < 16)
+                    resolve_stats.samples.push_back({address, size, kind, region});
+            }
+            return false;
+        }
+        if (diag) resolve_stats.arena.fetch_add(1, std::memory_order_relaxed);
         handle = arena.arena->Handle();
         offset = arena.offset;
         for (const auto& a : r.arena_reads)
@@ -1226,7 +1304,7 @@ static np::DrawResult Record(np::Segment& s, void* regs_ptr, u64 key, const u32*
         // The same capped range the command processor binds (CapReadBufferSize).
         const u64 bound = CapReadBufferSize(*g.instance, sharp.GetSize(),
                                             stage.buffers[slot.desc].is_written);
-        if (!resolve(sharp.base_address, bound, handle, offset)) return fail(MissBuffer);
+        if (!resolve(sharp.base_address, bound, handle, offset, 0)) return fail(MissBuffer);
         const u64 aligned = Common::AlignDown(offset, alignment);
         push.buf_offsets[slot.binding] = u8(offset - aligned);
         info = vk::DescriptorBufferInfo{handle, aligned, bound + (offset - aligned)};
@@ -1235,7 +1313,9 @@ static np::DrawResult Record(np::Segment& s, void* regs_ptr, u64 key, const u32*
     // the recorded segment executes, after this push. A template holding a view destroyed since
     // it was learned was pushed here first: the NVIDIA driver reads the view object at the push
     // and faulted on the freed memory (AMD's does not, the recording was discarded). Views known
-    // to be destroyed send the draw to the full path; the segment's validation drops the template.
+    // to be destroyed send the draw to the full path, and the template is dropped here: the
+    // segment's validation did not catch it (33 million draws rejected in a 32 minute session
+    // before the drop), the full path learns it again with live views.
     for (const auto& write : t->writes) {
         if (!write.pImageInfo) continue;
         for (u32 e = 0; e < write.descriptorCount; ++e) {
@@ -1243,6 +1323,9 @@ static np::DrawResult Record(np::Segment& s, void* regs_ptr, u64 key, const u32*
                 static std::atomic<u32> dead_views{};
                 const u32 n = dead_views.fetch_add(1, std::memory_order_relaxed) + 1;
                 if ((n & (n - 1)) == 0) std::fprintf(stderr, "NATIVE_PASSES_DEAD_VIEW count=%u\n", n);
+                // The command processor erases it at its next material lookup: the table must not
+                // be written here (see NativeMaterial::RequestDrop).
+                NativeMaterial::RequestDrop(t->key);
                 return fail(MissCommand);
             }
         }
@@ -1288,7 +1371,7 @@ static np::DrawResult Record(np::Segment& s, void* regs_ptr, u64 key, const u32*
             vk::Buffer handle{};
             u64 offset = 0;
             if (buffer.base_address && buffer.GetSize() &&
-                !resolve(buffer.base_address, buffer.GetSize(), handle, offset))
+                !resolve(buffer.base_address, buffer.GetSize(), handle, offset, 1))
                 return fail(MissBuffer);
             handles.push_back(handle);
             offsets.push_back(offset);
@@ -1301,7 +1384,7 @@ static np::DrawResult Record(np::Segment& s, void* regs_ptr, u64 key, const u32*
         vk::Buffer index_handle;
         u64 index_offset;
         if (!resolve(regs.index_base_address.Address<VAddr>(), u64(regs.num_indices) * index_size,
-                     index_handle, index_offset))
+                     index_handle, index_offset, 1))
             return fail(MissBuffer);
         cmd.bindIndexBuffer(index_handle, index_offset,
                             index16 ? vk::IndexType::eUint16 : vk::IndexType::eUint32);
@@ -1330,7 +1413,7 @@ static np::DrawResult Record(np::Segment& s, void* regs_ptr, u64 key, const u32*
         // processor orders it after their writer, NativePassExecute).
         vk::Buffer args_handle;
         u64 args_offset;
-        if (!resolve(d.args_address, sizeof(VkDrawIndexedIndirectCommand), args_handle, args_offset))
+        if (!resolve(d.args_address, sizeof(VkDrawIndexedIndirectCommand), args_handle, args_offset, 2))
             return fail(MissBuffer);
         cmd.drawIndexedIndirect(args_handle, args_offset, 1, sizeof(VkDrawIndexedIndirectCommand));
     } else if (d.autod) {
@@ -1545,6 +1628,55 @@ static void Report() {
                  (unsigned long long)cp_stats.learn_failed,
                  (unsigned long long)cp_stats.relearn,
                  (unsigned long long)cp_stats.inherited_merged, rejects.c_str());
+    if (ResolveDiag()) {
+        auto& r = resolve_stats;
+        std::string regions, callers, samples;
+        for (u32 i = 0; i < ResolveRegionCount; ++i) {
+            char item[40];
+            std::snprintf(item, sizeof(item), " %s=%llu", resolve_region_names[i],
+                          (unsigned long long)r.miss[i].load(std::memory_order_relaxed));
+            regions += item;
+        }
+        static const char* const caller_names[3] = {"binding", "geometry", "indirect"};
+        for (u32 i = 0; i < 3; ++i) {
+            char item[40];
+            std::snprintf(item, sizeof(item), " %s=%llu", caller_names[i],
+                          (unsigned long long)r.caller[i].load(std::memory_order_relaxed));
+            callers += item;
+        }
+        {
+            std::scoped_lock lock{r.sample_mutex};
+            if (!r.samples_reported.load(std::memory_order_relaxed) && !r.samples.empty()) {
+                for (const auto& s : r.samples) {
+                    char item[96];
+                    std::snprintf(item, sizeof(item), " %llx:%llu:%s:%s",
+                                  (unsigned long long)s.address, (unsigned long long)s.size,
+                                  s.caller < 3 ? caller_names[s.caller] : "?",
+                                  s.region < ResolveRegionCount ? resolve_region_names[s.region] : "?");
+                    samples += item;
+                }
+                r.samples_reported.store(true, std::memory_order_relaxed);
+            }
+        }
+        static const char* const arena_names[6] = {"ok", "invalid", "not_resident", "no_arena",
+                                                   "mixed_arena", "no_tick"};
+        std::string arena_text;
+        for (u32 i = 0; i < 6; ++i) {
+            char item[40];
+            std::snprintf(item, sizeof(item), " %s=%llu", arena_names[i],
+                          (unsigned long long)r.arena_reason[i].load(std::memory_order_relaxed));
+            arena_text += item;
+        }
+        std::fprintf(stderr,
+                     "NATIVE_PASSES_RESOLVE calls=%llu unified=%llu arena=%llu arena_attempts=%llu "
+                     "huge=%llu miss[%s ] caller[%s ] arena_reason[%s ] samples[%s ]\n",
+                     (unsigned long long)r.calls.load(std::memory_order_relaxed),
+                     (unsigned long long)r.unified.load(std::memory_order_relaxed),
+                     (unsigned long long)r.arena.load(std::memory_order_relaxed),
+                     (unsigned long long)r.arena_attempts.load(std::memory_order_relaxed),
+                     (unsigned long long)r.huge.load(std::memory_order_relaxed), regions.c_str(),
+                     callers.c_str(), arena_text.c_str(), samples.c_str());
+    }
     np::Report();
     NativeMaterialReport();
 }
@@ -1598,6 +1730,7 @@ bool Rasterizer::NativePassExecute(iss::native_passes::Segment& s,
                                    const std::function<void()>& end_draw, u64& tick) {
     const iss::cp_path::Scope cp_path_scope{iss::cp_path::RecorderExecute};
     using namespace NativePasses;
+    NativeMaterial::DrainDrops();
     auto& c = cp_stats;
     if ((++c.report & 1023) == 1) Report();
     const bool indirect_first = ((s.first_draw[0] >> 8) & 0xFF) == 0x25;
@@ -2010,6 +2143,7 @@ u64 Rasterizer::NativePassLearnKey(u64 engine_key) {
 
 void Rasterizer::NativePassLearn(u64 key, const GraphicsPipeline* pipeline, const RenderState& render) {
     using namespace NativePasses;
+    NativeMaterial::DrainDrops();
     auto& u = Rejected();
     const auto give_up = [&] {
         ++cp_stats.learn_failed;

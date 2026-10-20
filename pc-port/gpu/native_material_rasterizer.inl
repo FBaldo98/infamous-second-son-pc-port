@@ -240,8 +240,9 @@ struct Rasterizer::NativeMaterialTemplate {
 namespace NativeMaterial {
 using Template = Rasterizer::NativeMaterialTemplate;
 struct Tables {
-    /// Written by the command processor only (under the exclusive lock); the engine threads read
-    /// under the shared lock, the command processor reads without it.
+    /// Written by the command processor only (under the exclusive lock; engine threads queue
+    /// drops with RequestDrop); the engine threads read under the shared lock, the command
+    /// processor reads without it.
     std::shared_mutex mutex;
     std::unordered_map<u64, const GraphicsPipeline*> shapes; ///< state key -> first pipeline
     std::unordered_map<u64, std::shared_ptr<const Template>> templates;
@@ -252,6 +253,28 @@ constexpr size_t DynamicBytes = offsetof(DynamicState, binds);
 static Tables& State() {
     static Tables tables;
     return tables;
+}
+
+// A template whose image views died is dropped at execution (TexturesValid) or, when the engine
+// threads record it, here. The engine thread cannot touch the table: the command processor reads
+// it without the lock (NativeMaterialFind, NativePassLearn), so the key is queued and the
+// command processor erases it at its next lookup.
+static std::mutex drop_mutex;
+static std::vector<u64> pending_drops;
+static void RequestDrop(u64 key) {
+    std::scoped_lock lock{drop_mutex};
+    if (pending_drops.size() < 4096) pending_drops.push_back(key);
+}
+static void DrainDrops() {
+    std::vector<u64> drops;
+    {
+        std::scoped_lock lock{drop_mutex};
+        if (pending_drops.empty()) return;
+        drops.swap(pending_drops);
+    }
+    auto& tables = State();
+    std::unique_lock lock{tables.mutex};
+    for (const u64 key : drops) tables.templates.erase(key);
 }
 
 // The template's writes with the draw's buffer infos (one per buffer slot).
@@ -304,6 +327,7 @@ static bool TexturesValid(VideoCore::TextureCache& cache, const T& t, bool& stal
 const Rasterizer::NativeMaterialTemplate* Rasterizer::NativeMaterialFind(u64 state_key) {
     const iss::cp_path::Scope cp_path_scope{iss::cp_path::MaterialFind};
     using namespace NativeMaterial;
+    DrainDrops();
     auto& tables = State();
     auto& c = Counters();
     const auto shape_it = tables.shapes.find(state_key);
@@ -416,6 +440,7 @@ bool Rasterizer::NativeMaterialBind(const NativeMaterialTemplate& t) {
 void Rasterizer::NativeMaterialLearn(u64 state_key, const GraphicsPipeline* pipeline,
                                      const RenderState& render) {
     using namespace NativeMaterial;
+    DrainDrops();
     auto& c = Counters();
     auto* caps = native_image_capture;
     if (!caps || !pipeline) return;

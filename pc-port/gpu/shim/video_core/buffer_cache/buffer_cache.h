@@ -360,8 +360,12 @@ public:
         u64 graphics_bda_tick{};
         explicit operator bool() const noexcept { return arena != nullptr; }
     };
+    /// Why PeekPublishedArena returned nothing (diagnosis: ISS_NATIVE_PASSES_RESOLVE).
+    enum class ArenaPeek : u8 { Ok, Invalid, NotResident, NoArena, MixedArena, NoSubmittedTick };
     /// Read-only C preflight. Returns empty while a required bind is still pending.
     [[nodiscard]] PublishedArena PeekPublishedArena(VAddr device_addr, u32 size) const;
+    [[nodiscard]] PublishedArena PeekPublishedArena(VAddr device_addr, u32 size,
+                                                    ArenaPeek& reason) const;
     struct AscArenaPreflight {
         u64 graphics_tick{};
         u64 mapping_generation{};

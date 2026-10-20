@@ -3115,18 +3115,40 @@ std::pair<const Buffer*, u64> BufferCache::PeekArena(VAddr device_addr, u32 size
 
 BufferCache::PublishedArena BufferCache::PeekPublishedArena(VAddr device_addr,
                                                             u32 size) const {
-    if (size == 0 || device_addr == 0 || device_addr > std::numeric_limits<u64>::max() - size)
+    ArenaPeek reason{};
+    return PeekPublishedArena(device_addr, size, reason);
+}
+
+BufferCache::PublishedArena BufferCache::PeekPublishedArena(VAddr device_addr, u32 size,
+                                                            ArenaPeek& reason) const {
+    reason = ArenaPeek::Ok;
+    if (size == 0 || device_addr == 0 || device_addr > std::numeric_limits<u64>::max() - size) {
+        reason = ArenaPeek::Invalid;
         return {};
+    }
     std::scoped_lock lock{residency_mutex};
     const u64 first_block = device_addr >> block_shift;
     const u64 last_block = (device_addr + size - 1) >> block_shift;
-    if (!IsResident(first_block, last_block)) return {};
+    if (!IsResident(first_block, last_block)) {
+        reason = ArenaPeek::NotResident;
+        return {};
+    }
     const u64 first_page = first_block >> blocks_per_arena_page_shift;
     const u64 last_page = last_block >> blocks_per_arena_page_shift;
     const auto* arena = address_space[first_page];
-    if (!arena || address_space[last_page] != arena) return {};
+    if (!arena) {
+        reason = ArenaPeek::NoArena;
+        return {};
+    }
+    if (address_space[last_page] != arena) {
+        reason = ArenaPeek::MixedArena;
+        return {};
+    }
     const auto required_tick = residency_publication.RequiredSubmittedTick(arena);
-    if (!required_tick) return {};
+    if (!required_tick) {
+        reason = ArenaPeek::NoSubmittedTick;
+        return {};
+    }
     return {arena, arena->Offset(device_addr), *required_tick,
             published_bda_g_tick.load(std::memory_order_acquire)};
 }
@@ -3877,13 +3899,22 @@ bool BufferCache::EnableUnified() {
         return fail("VK_EXT_external_memory_host not available");
     }
     const VAddr base = iss::unified::RangeBase();
-    const u64 size = iss::unified::RangeSize();
-    const auto span = memory->DescribeBacking(base, size);
+    const u64 requested = iss::unified::RangeSize();
+    const auto span = memory->DescribeBacking(base, requested);
     if (!span) {
         return false; // not mapped yet: the next binding tries again
     }
-    if (span->size != size) {
-        return fail("the range is not one contiguous mapping");
+    // The last page of a heap can be a gap (heap C: the mapping ends 64 KB short): import the
+    // contiguous part, the rest stays arena-backed.
+    const u64 size = span->size;
+    if (size < block_size) {
+        return fail("the range is not mapped");
+    }
+    if (size != requested) {
+        std::fprintf(stderr,
+                     "UNIFIED_MEMORY contiguous part: guest 0x%llx size 0x%llx of 0x%llx\n",
+                     (unsigned long long)base, (unsigned long long)size,
+                     (unsigned long long)requested);
     }
     if ((base & (block_size - 1)) != 0 || (size & (block_size - 1)) != 0) {
         return fail("the range is not aligned to sparse blocks");
