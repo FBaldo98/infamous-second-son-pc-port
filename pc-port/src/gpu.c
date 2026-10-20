@@ -17,6 +17,14 @@ static int (*dialog_open)(const IssDialog *);
 static int (*dialog_poll)(IssDialogResult *);
 static void (*dialog_close)(void);
 static int (*dialog_active)(void);
+// shadPS4's Windows guest red-zone protection (gpu/red_zone_patches.cpp).
+static long long (*patch_red_zone)(unsigned char *,unsigned long long,const unsigned long long *,
+                                   const unsigned long long *,unsigned long long,unsigned char *,unsigned long long);
+long long gpu_patch_red_zone(unsigned char *image,uint64_t image_size,const uint64_t *addresses,const uint64_t *sizes,
+                             uint64_t count,unsigned char *trampoline,uint64_t trampoline_size){
+    return patch_red_zone?patch_red_zone(image,image_size,(const unsigned long long *)addresses,(const unsigned long long *)sizes,
+                                         count,trampoline,trampoline_size):-1;
+}
 int gpu_start(uint32_t sdk_version,uint64_t image_base){
     const char *enabled=getenv("ISS_GPU");if(!enabled||strcmp(enabled,"1"))return 0;
     char path[2048];GetModuleFileNameA(NULL,path,sizeof(path));char *slash=strrchr(path,'\\');if(!slash)return -1;strcpy(slash,"\\iss-gpu.dll");
@@ -30,6 +38,7 @@ int gpu_start(uint32_t sdk_version,uint64_t image_base){
     void (*mapped)(uint64_t,uint64_t,uint8_t *)=(void *)GetProcAddress(dll,"iss_gpu_map");
     dialog_open=(void *)GetProcAddress(dll,"iss_gpu_dialog_open");dialog_poll=(void *)GetProcAddress(dll,"iss_gpu_dialog_poll");
     dialog_close=(void *)GetProcAddress(dll,"iss_gpu_dialog_close");dialog_active=(void *)GetProcAddress(dll,"iss_gpu_dialog_active");
+    patch_red_zone=(void *)GetProcAddress(dll,"iss_gpu_patch_red_zone");
     if(!initialize||!resolve_import||!handle_fault||!mapped)return -1;
     IssGpuCallbacks callbacks={0};callbacks.struct_size=sizeof(callbacks);callbacks.sdk_version=sdk_version;
     callbacks.psf_attributes=545259522;callbacks.width=1280;callbacks.height=720;

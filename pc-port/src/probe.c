@@ -65,6 +65,50 @@ static void *low_allocate(size_t size, DWORD mode) {
     return NULL;
 }
 
+// A host exception no structured handler took (passed on by fault() below): report and stop.
+static LONG WINAPI host_fault(EXCEPTION_POINTERS *exception) {
+    const uintptr_t address = (uintptr_t)exception->ExceptionRecord->ExceptionAddress;
+    HMODULE host = NULL;
+    char name[MAX_PATH] = "?";
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCWSTR)address, &host) && host)
+        GetModuleFileNameA(host, name, sizeof(name));
+    const char *base = strrchr(name, '\\');
+    printf("PROBE_EVENT {\"status\":\"host_fault\",\"exception\":\"0x%08lx\",\"module\":\"%s\",\"module_offset\":\"0x%llx\","
+           "\"rip\":\"0x%llx\",\"accessed\":\"0x%llx\",\"tid\":%lu}\n",
+           exception->ExceptionRecord->ExceptionCode, base ? base + 1 : name,
+           (unsigned long long)(host ? address - (uintptr_t)host : 0), (unsigned long long)address,
+           (unsigned long long)(exception->ExceptionRecord->NumberParameters >= 2
+                                    ? exception->ExceptionRecord->ExceptionInformation[1] : 0),
+           GetCurrentThreadId());
+    // The host stack from the faulting context, through the unwind data of each module.
+    CONTEXT context = *exception->ContextRecord;
+    for (int frame = 0; frame < 32 && context.Rip; ++frame) {
+        HMODULE module = NULL;
+        char path[MAX_PATH] = "?";
+        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               (LPCWSTR)(uintptr_t)context.Rip, &module) && module)
+            GetModuleFileNameA(module, path, sizeof(path));
+        const char *file = strrchr(path, '\\');
+        if (module)
+            printf("HOST_FAULT_FRAME %d %s+0x%llx\n", frame, file ? file + 1 : path,
+                   (unsigned long long)(context.Rip - (uintptr_t)module));
+        else
+            printf("HOST_FAULT_FRAME %d 0x%llx%s\n", frame, (unsigned long long)context.Rip,
+                   context.Rip - (uintptr_t)image < image_size ? " (guest)" : "");
+        DWORD64 module_base = 0;
+        RUNTIME_FUNCTION *function = RtlLookupFunctionEntry(context.Rip, &module_base, NULL);
+        if (!function) break;
+        void *handler_data = NULL;
+        DWORD64 establisher = 0;
+        RtlVirtualUnwind(UNW_FLAG_NHANDLER, module_base, context.Rip, function, &context, &handler_data,
+                         &establisher, NULL);
+    }
+    fflush(stdout);
+    TerminateProcess(GetCurrentProcess(), 22);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
 static LONG CALLBACK fault(EXCEPTION_POINTERS *exception) {
     DWORD exception_code=exception->ExceptionRecord->ExceptionCode;
     // Let Windows debug-print/thread-name notifications and C++ exceptions reach
@@ -75,7 +119,53 @@ static LONG CALLBACK fault(EXCEPTION_POINTERS *exception) {
        exception_code!=EXCEPTION_PRIV_INSTRUCTION)return EXCEPTION_CONTINUE_SEARCH;
     if (runtime_emulate_tls(exception)) return EXCEPTION_CONTINUE_EXECUTION;
     if (runtime_emulate_sse4a(exception)) return EXCEPTION_CONTINUE_EXECUTION;
-    if (gpu_handle_fault(exception)) return EXCEPTION_CONTINUE_EXECUTION;
+    if (gpu_handle_fault(exception)) {
+        // Diagnostics: the first handled fault of each guest code address. Windows writes the
+        // exception frame over the System V red zone below rsp, so a handled fault inside guest
+        // code that keeps values there corrupts them.
+        const uintptr_t rip = (uintptr_t)exception->ContextRecord->Rip;
+        if (rip >= (uintptr_t)image && rip - (uintptr_t)image < image_size) {
+            static volatile LONG64 seen[4096];
+            static volatile LONG reported;
+            const uint64_t offset = rip - (uintptr_t)image;
+            for (uint64_t i = (offset * UINT64_C(0x9e3779b97f4a7c15)) >> 52, n = 0; n < 4096; ++n, i = (i + 1) & 4095) {
+                const LONG64 prior = InterlockedCompareExchange64(&seen[i], (LONG64)offset + 1, 0);
+                if (prior == (LONG64)offset + 1) break;
+                if (prior == 0) {
+                    if (InterlockedIncrement(&reported) <= 512)
+                        fprintf(stderr, "GUEST_FAULT_HANDLED rip=+0x%llx address=0x%llx rsp=0x%llx\n",
+                                (unsigned long long)offset,
+                                (unsigned long long)(exception->ExceptionRecord->NumberParameters >= 2
+                                                         ? exception->ExceptionRecord->ExceptionInformation[1] : 0),
+                                (unsigned long long)exception->ContextRecord->Rsp);
+                    break;
+                }
+            }
+        }
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    // Host code (a loaded DLL or the probe itself, not guest code or a trampoline): its own
+    // structured exception handlers come after this vectored one. Drivers raise and catch
+    // exceptions of their own (an NVIDIA Vulkan driver access violation was turned into a fatal
+    // guest fault here); what nobody handles reaches host_fault below.
+    {
+        HMODULE host = NULL;
+        if (exception_code != EXCEPTION_BREAKPOINT &&
+            GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               (LPCWSTR)exception->ExceptionRecord->ExceptionAddress, &host) && host) {
+            static volatile LONG passed;
+            if (InterlockedIncrement(&passed) <= 16) {
+                char name[MAX_PATH] = "?";
+                GetModuleFileNameA(host, name, sizeof(name));
+                const char *base = strrchr(name, '\\');
+                fprintf(stderr, "HOST_EXCEPTION_PASSED code=0x%08lx module=%s+0x%llx\n", exception_code,
+                        base ? base + 1 : name,
+                        (unsigned long long)((uintptr_t)exception->ExceptionRecord->ExceptionAddress - (uintptr_t)host));
+                fflush(stderr);
+            }
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+    }
     uintptr_t address = (uintptr_t)exception->ExceptionRecord->ExceptionAddress;
     uintptr_t accessed = 0;
     DWORD code = exception->ExceptionRecord->ExceptionCode;
@@ -219,6 +309,7 @@ int main(int argc, char **argv) {
     if (linked) runtime_configure(image, image_size, modules, module_count, procparam);
     for(uint64_t i=0;i<ns;++i)memory_register_image(segments[i].address,segments[i].size,(uint32_t)segments[i].flags);
     if (!AddVectoredExceptionHandler(1, fault)) fail("cannot install diagnostic exception handler");
+    SetUnhandledExceptionFilter(host_fault);
     if(linked&&!strcmp(argv[2],"--entry")){
         uint32_t sdk;memcpy(&sdk,image+procparam+16,4);
         if(gpu_start(sdk,(uint64_t)(uintptr_t)image))fail("graphics initialization failed");
@@ -237,6 +328,33 @@ int main(int argc, char **argv) {
             if (host) value = host + r->addend;
         }
         memcpy(image + r->target, &value, 8);
+    }
+    if (linked) {
+        // Rewrite the SSE4a instructions before any guest code runs (CPUs without SSE4a).
+        uint64_t *code_addresses = checked_calloc(ns, sizeof(uint64_t)), *code_sizes = checked_calloc(ns, sizeof(uint64_t));
+        uint64_t code_count = 0;
+        for (uint64_t i = 0; i < ns; ++i)
+            if (segments[i].flags & 1) {
+                code_addresses[code_count] = segments[i].address;
+                code_sizes[code_count++] = segments[i].size;
+            }
+        // Windows writes exception frames over the guest's System V red zone: memory accesses of
+        // guest functions with live red zone bytes run with rsp moved below it (shadPS4's static
+        // protection, in iss-gpu.dll; it also rewrites the SSE4a instructions of those functions).
+        // ISS_RED_ZONE_PATCH=0 off.
+        const char *red_zone = getenv("ISS_RED_ZONE_PATCH");
+        if (!red_zone || red_zone[0] != '0') {
+            const size_t trampoline_bytes = 8u << 20;
+            unsigned char *trampoline = NULL;
+            const uintptr_t first = ((uintptr_t)image + image_size + 0xffffff) & ~(uintptr_t)0xffffff;
+            for (uintptr_t a = first; a < first + ((uintptr_t)1 << 30) && !trampoline; a += 0x1000000)
+                trampoline = VirtualAlloc((void *)a, trampoline_bytes, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+            if (!trampoline || gpu_patch_red_zone(image, image_size, code_addresses, code_sizes, code_count,
+                                                  trampoline, trampoline_bytes) < 0)
+                fprintf(stderr, "RED_ZONE protection unavailable\n");
+        }
+        runtime_patch_sse4a(code_addresses, code_sizes, code_count);
+        free(code_addresses); free(code_sizes);
     }
     protect(image, page_round(image_size), PAGE_NOACCESS);
     for (uint64_t i = 0; i < ns; ++i)

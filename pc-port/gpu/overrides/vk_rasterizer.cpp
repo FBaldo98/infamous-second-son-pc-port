@@ -128,6 +128,32 @@ uint64_t IssImageBase(); // bridge.cpp
 
 namespace Vulkan {
 
+// iss: a read-only guest buffer is bound at most this large. The game binds typed buffers that
+// run from their data to the end of the memory region (a vertex shader: 1.29 billion 2-byte
+// records, 2.4 GB); the bound range is made resident in device memory as a whole, more than a
+// 4 GB GPU has. Reads past the cap return zero (robust buffer access) instead. Default: a quarter
+// of the device memory budget (3.5 GB on a 16 GB GPU, 736 MB on a 4 GB one);
+// ISS_READ_BUFFER_CAP_MB sets it, 0 turns it off.
+static u64 CapReadBufferSize(const Instance& instance, u64 size, bool is_written) {
+    static const u64 cap = [&instance] {
+        if (const char* p = std::getenv("ISS_READ_BUFFER_CAP_MB")) {
+            const u64 mb = std::strtoull(p, nullptr, 10);
+            return mb ? mb << 20 : ~u64{0};
+        }
+        // 64 KB aligned: a multiple of every texel size, as buffer views need.
+        return std::max<u64>(instance.GetTotalMemoryBudget() / 4, 256ull << 20) & ~u64{0xffff};
+    }();
+    if (is_written || size <= cap) {
+        return size;
+    }
+    static std::atomic<u32> reported{};
+    if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
+        std::fprintf(stderr, "READ_BUFFER_CAP size=%llu capped=%llu\n", (unsigned long long)size,
+                     (unsigned long long)cap);
+    }
+    return cap;
+}
+
 thread_local Rasterizer::SplitThreadState Rasterizer::split_thread_state{};
 #include "draw_pipe_rasterizer.inl"
 
@@ -1858,7 +1884,7 @@ std::optional<Rasterizer::PreparedComputeInputs> Rasterizer::PrepareComputeInput
         case Shader::BufferType::Guest: {
             const auto sharp = desc.GetSharp(stage);
             if (sharp.base_address == 0 || sharp.GetSize() == 0) break;
-            const u64 size = memory->ClampRangeSize(sharp.base_address, sharp.GetSize());
+            const u64 size = CapReadBufferSize(instance, memory->ClampRangeSize(sharp.base_address, sharp.GetSize()), desc.is_written);
             if (!size || !buffer_cache.PlanGuestAccess(sharp.base_address, size,
                                                         desc.is_written,
                                                         prepared.mapping_generation,
@@ -2073,7 +2099,7 @@ std::optional<Rasterizer::PreparedResourceBindings> Rasterizer::PrepareResourceB
         if (desc.buffer_type == Shader::BufferType::Guest) {
             const auto sharp = desc.GetSharp(stage);
             if (sharp.base_address && sharp.GetSize()) {
-                const u64 size = memory->ClampRangeSize(sharp.base_address, sharp.GetSize());
+                const u64 size = CapReadBufferSize(instance, memory->ClampRangeSize(sharp.base_address, sharp.GetSize()), desc.is_written);
                 if (!size || size > std::numeric_limits<u32>::max()) return std::nullopt;
                 auto guest = buffer_cache.PrepareGuestBufferBinding(
                     sharp.base_address, static_cast<u32>(size), desc.is_written);
@@ -2312,7 +2338,7 @@ Rasterizer::AscDispatchPlan Rasterizer::PrepareAscDispatch(const AscDispatchInpu
             if (desc.buffer_type != Shader::BufferType::Guest) continue;
             const auto sharp = desc.GetSharp(stage);
             if (!sharp.base_address || !sharp.GetSize()) continue;
-            const u64 size = memory->ClampRangeSize(sharp.base_address, sharp.GetSize());
+            const u64 size = CapReadBufferSize(instance, memory->ClampRangeSize(sharp.base_address, sharp.GetSize()), desc.is_written);
             if (!size || size > std::numeric_limits<u32>::max()) return out;
             if (buffer_cache.PrepareGuestBufferBinding(
                     sharp.base_address, static_cast<u32>(size), desc.is_written)) continue;
@@ -2510,7 +2536,7 @@ std::optional<iss::g4::GraphicsRecordingProof> Rasterizer::RecordFallbackSnapsho
         } else if (desc.buffer_type == Shader::BufferType::Guest) {
             const auto sharp = desc.GetSharp(stage);
             if (sharp.base_address && sharp.GetSize()) {
-                const u64 size = memory->ClampRangeSize(sharp.base_address, sharp.GetSize());
+                const u64 size = CapReadBufferSize(instance, memory->ClampRangeSize(sharp.base_address, sharp.GetSize()), desc.is_written);
                 if (!size || !buffer_cache.PlanGuestAccess(sharp.base_address, size,
                                                             desc.is_written,
                                                             inputs.mapping_generation,
@@ -4221,10 +4247,33 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             if (vsharp.base_address == 0 || vsharp.GetSize() == 0) {
                 buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
             } else {
-                const u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
-                if (size != vsharp.GetSize()) {
+                const u64 clamped = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
+                if (clamped != vsharp.GetSize()) {
                     LOG_ERROR(Render, "Clamped size from {} to {} for stage {:#x}",
-                              vsharp.GetSize(), size, stage.pgm_hash);
+                              vsharp.GetSize(), clamped, stage.pgm_hash);
+                }
+                const u64 size = CapReadBufferSize(instance, clamped, desc.is_written);
+                if (size >= (256ull << 20)) [[unlikely]] {
+                    // iss: bindings this large must be resident in device memory as a whole;
+                    // they exhaust 4 GB GPUs. Reported once per shader and descriptor.
+                    static std::mutex huge_mutex;
+                    static std::unordered_set<u64> huge_seen;
+                    const u64 key = stage.pgm_hash << 8 | u64(&desc - stage.buffers.data());
+                    std::scoped_lock huge_lock{huge_mutex};
+                    if (huge_seen.insert(key).second) {
+                        std::fprintf(stderr,
+                                     "HUGE_BUFFER hash=0x%llx stage=%u descriptor=%u base=0x%llx "
+                                     "stride=%u records=%u size=%llu clamped=%llu written=%u "
+                                     "formatted=%u\n",
+                                     (unsigned long long)stage.pgm_hash, unsigned(stage.hw_stage),
+                                     unsigned(&desc - stage.buffers.data()),
+                                     (unsigned long long)vsharp.base_address,
+                                     unsigned(vsharp.GetStride()), unsigned(vsharp.num_records),
+                                     (unsigned long long)vsharp.GetSize(),
+                                     (unsigned long long)size, unsigned(desc.is_written),
+                                     unsigned(desc.is_formatted));
+                        std::fflush(stderr);
+                    }
                 }
                 // Correlate the game's 48-byte feedback descriptor with the
                 // EBOOT call-site observation. This is passive: recycled guest

@@ -18,6 +18,7 @@ uintptr_t runtime_resolve(const char *identity, int data);
 int runtime_emulate_tls(EXCEPTION_POINTERS *exception);
 uint64_t runtime_tls_fault_count(void);
 int runtime_emulate_sse4a(EXCEPTION_POINTERS *exception);
+void runtime_patch_sse4a(const uint64_t *segment_addresses, const uint64_t *segment_sizes, uint64_t count);
 uintptr_t sync_resolve(const char *identity);
 uintptr_t thread_resolve(const char *identity);
 uintptr_t time_resolve(const char *identity);
@@ -55,6 +56,8 @@ void memory_set_map_hook(void (*hook)(uint64_t,uint64_t,uint8_t *));
 uint64_t runtime_tsc_frequency(void);
 uint64_t runtime_process_time_us(void);
 int gpu_start(uint32_t sdk_version,uint64_t image_base);
+long long gpu_patch_red_zone(unsigned char *image,uint64_t image_size,const uint64_t *addresses,const uint64_t *sizes,
+                             uint64_t count,unsigned char *trampoline,uint64_t trampoline_size);
 uintptr_t gpu_resolve(const char *identity);
 int gpu_handle_fault(EXCEPTION_POINTERS *exception);
 int gpu_readback(uint64_t address,uint64_t size);

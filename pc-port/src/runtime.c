@@ -2,6 +2,7 @@
 #define _CRT_RAND_S
 #include "runtime.h"
 #include <Zydis/Zydis.h>
+#include <intrin.h>
 #include <malloc.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -531,7 +532,188 @@ int runtime_emulate_sse4a(EXCEPTION_POINTERS *e) {
     const uint64_t site = c->Rip;
     c->Rip += n + (immediate ? 2 : 0);
     const LONG64 count = InterlockedIncrement64(&sse4a_emulated);
+    if (count == 1)
+        fprintf(stderr, "SSE4A_TRAP site=0x%llx: emulated through an exception (it overwrites the "
+                        "guest red zone below rsp)\n", (unsigned long long)site);
     if ((count & (count - 1)) == 0)
         fprintf(stderr, "SSE4A_EMULATED count=%lld site=0x%llx\n", (long long)count, (unsigned long long)site);
     return 1;
+}
+
+// SSE4a site patching. An emulated EXTRQ is not enough: Windows writes the exception record and
+// CONTEXT on the faulting thread's stack right below rsp, over the System V red zone the guest
+// keeps live values in (the game's hot EXTRQ function holds red zone values across 32 of its 48
+// EXTRQs, and came out wrong: a null pointer later in the intro). Before any guest code runs,
+// every register-form EXTRQ of the executable segments is rewritten into a jump to a trampoline
+// that computes it below the red zone, without an exception:
+//   lea rsp,[rsp-128]; push rax; push rcx; push rdx; pushfq
+//   movq rax, xmmS; movq rdx, xmmD; mov ecx, eax; shr ecx, 8; shr rdx, cl     (index)
+//   lea ecx,[rax-1]; and ecx, 63; mov eax, 2; shl rax, cl; dec rax; and rdx, rax (length 0 = 64)
+//   movq xmmD, rdx (upper qword zeroed, as AMD); popfq; pop rdx; pop rcx; pop rax; lea rsp,[rsp+128]
+//   <the instructions displaced by the 5-byte jmp>; jmp back
+// A site is left to the trap emulation when a displaced instruction is position dependent or a
+// direct branch of the segment lands inside the rewritten bytes. ISS_SSE4A_PATCH=0 off.
+enum { SSE4A_POOL_BYTES = 1 << 20, SSE4A_SLOT_BYTES = 128, SSE4A_MAX_SITES = 4096 };
+typedef struct { uint64_t site, length, end; unsigned dst, src; int ok; } Sse4aSite;
+
+static int cpu_has_sse4a(void) {
+    int r[4];
+    __cpuid(r, (int)0x80000000);
+    if ((unsigned)r[0] < 0x80000001u) return 0;
+    __cpuid(r, (int)0x80000001);
+    return (r[2] >> 6) & 1;
+}
+// EXTRQ xmm, xmm at p: 66 [REX.R/B] 0F 79 modrm(mod=3). Returns its length or 0.
+static unsigned sse4a_extrq_reg(const unsigned char *p, unsigned *dst, unsigned *src) {
+    unsigned n = 1, rex = 0;
+    if (p[0] != 0x66) return 0;
+    if ((p[1] & 0xf0) == 0x40) {
+        if (p[1] & 0x0a) return 0; // REX.W/REX.X: not the forms emitted
+        rex = p[n++];
+    }
+    if (p[n] != 0x0f || p[n + 1] != 0x79 || (p[n + 2] >> 6) != 3) return 0;
+    *dst = ((rex >> 2) & 1) << 3 | ((p[n + 2] >> 3) & 7);
+    *src = (rex & 1) << 3 | (p[n + 2] & 7);
+    return n + 3;
+}
+// movq r64, xmm (0x7E) or movq xmm, r64 (0x6E).
+static unsigned char *sse4a_emit_movq(unsigned char *p, unsigned char op, unsigned xmm, unsigned gpr) {
+    *p++ = 0x66;
+    *p++ = (unsigned char)(0x48 | ((xmm >> 3) << 2) | (gpr >> 3));
+    *p++ = 0x0f; *p++ = op;
+    *p++ = (unsigned char)(0xc0 | ((xmm & 7) << 3) | (gpr & 7));
+    return p;
+}
+static unsigned char *sse4a_emit_extrq(unsigned char *p, unsigned dst, unsigned src) {
+    static const unsigned char enter[] = {0x48, 0x8D, 0x64, 0x24, 0x80, 0x50, 0x51, 0x52, 0x9C};
+    static const unsigned char field[] = {0x89, 0xC1, 0xC1, 0xE9, 0x08, 0x48, 0xD3, 0xEA,
+                                          0x8D, 0x48, 0xFF, 0x83, 0xE1, 0x3F, 0xB8, 0x02, 0x00, 0x00, 0x00,
+                                          0x48, 0xD3, 0xE0, 0x48, 0xFF, 0xC8, 0x48, 0x21, 0xC2};
+    static const unsigned char leave[] = {0x9D, 0x5A, 0x59, 0x58, 0x48, 0x8D, 0xA4, 0x24, 0x80, 0x00, 0x00, 0x00};
+    memcpy(p, enter, sizeof(enter)); p += sizeof(enter);
+    p = sse4a_emit_movq(p, 0x7e, src, 0); // rax = xmmS
+    p = sse4a_emit_movq(p, 0x7e, dst, 2); // rdx = xmmD
+    memcpy(p, field, sizeof(field)); p += sizeof(field);
+    p = sse4a_emit_movq(p, 0x6e, dst, 2); // xmmD = rdx
+    memcpy(p, leave, sizeof(leave)); p += sizeof(leave);
+    return p;
+}
+
+void runtime_patch_sse4a(const uint64_t *segment_addresses, const uint64_t *segment_sizes, uint64_t count) {
+    char value[8] = {0};
+    GetEnvironmentVariableA("ISS_SSE4A_PATCH", value, sizeof(value));
+    if (!source_image || value[0] == '0' || cpu_has_sse4a()) return;
+    ZydisDecoder decoder;
+    ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
+    static Sse4aSite sites[SSE4A_MAX_SITES];
+    uint64_t found = 0;
+    // Pass 1: a linear sweep of the code finds the EXTRQ instruction starts and how many bytes
+    // a 5-byte jmp displaces there.
+    for (uint64_t s = 0; s < count; ++s) {
+        const unsigned char *base = source_image + segment_addresses[s];
+        for (uint64_t at = 0; at < segment_sizes[s];) {
+            ZydisDecodedInstruction ins;
+            const uint64_t left = segment_sizes[s] - at;
+            if (!ZYAN_SUCCESS(ZydisDecoderDecodeInstruction(&decoder, NULL, base + at, left < 15 ? left : 15, &ins))) {
+                ++at;
+                continue;
+            }
+            unsigned dst, src;
+            if (ins.mnemonic == ZYDIS_MNEMONIC_EXTRQ && left >= 16 && sse4a_extrq_reg(base + at, &dst, &src) == ins.length &&
+                found < SSE4A_MAX_SITES) {
+                Sse4aSite *site = &sites[found++];
+                *site = (Sse4aSite){segment_addresses[s] + at, 0, 0, dst, src, 1};
+                uint64_t cover = ins.length;
+                while (cover < 5) {
+                    ZydisDecodedInstruction next;
+                    if (!ZYAN_SUCCESS(ZydisDecoderDecodeInstruction(&decoder, NULL, base + at + cover, 15, &next)) ||
+                        ((next.attributes & ZYDIS_ATTRIB_IS_RELATIVE) && next.mnemonic != ZYDIS_MNEMONIC_EXTRQ) ||
+                        next.meta.branch_type != ZYDIS_BRANCH_TYPE_NONE) {
+                        site->ok = 0;
+                        break;
+                    }
+                    cover += next.length;
+                }
+                site->length = cover;
+                site->end = site->site + cover;
+            }
+            at += ins.length;
+        }
+    }
+    if (!found) return;
+    // Pass 2: no direct branch may land inside the bytes a site rewrites (after its first byte).
+    for (uint64_t s = 0; s < count; ++s) {
+        const unsigned char *base = source_image + segment_addresses[s];
+        for (uint64_t at = 0; at < segment_sizes[s];) {
+            ZydisDecodedInstruction ins;
+            const uint64_t left = segment_sizes[s] - at;
+            if (!ZYAN_SUCCESS(ZydisDecoderDecodeInstruction(&decoder, NULL, base + at, left < 15 ? left : 15, &ins))) {
+                ++at;
+                continue;
+            }
+            if (ins.meta.branch_type != ZYDIS_BRANCH_TYPE_NONE && ins.raw.imm[0].is_relative) {
+                const uint64_t target = segment_addresses[s] + at + ins.length + (uint64_t)ins.raw.imm[0].value.s;
+                for (uint64_t i = 0; i < found; ++i)
+                    if (target > sites[i].site && target < sites[i].end) sites[i].ok = 0;
+            }
+            at += ins.length;
+        }
+    }
+    unsigned char *pool = NULL;
+    const uint64_t start = ((uint64_t)(uintptr_t)source_image + source_size + 0xffff) & ~UINT64_C(0xffff);
+    for (uint64_t a = start; a < start + (UINT64_C(1) << 30) && !pool; a += 0x10000)
+        pool = VirtualAlloc((void *)(uintptr_t)a, SSE4A_POOL_BYTES, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+    if (!pool) {
+        fprintf(stderr, "SSE4A_PATCH no trampoline memory near the image; %llu sites left emulated\n",
+                (unsigned long long)found);
+        return;
+    }
+    uint64_t patched = 0, used = 0, patched_end = 0;
+    for (uint64_t i = 0; i < found && used + SSE4A_SLOT_BYTES <= SSE4A_POOL_BYTES; ++i) {
+        Sse4aSite *site = &sites[i];
+        // An EXTRQ displaced by the jmp of the site before it runs in that site's trampoline.
+        if (site->site < patched_end) {
+            ++patched;
+            continue;
+        }
+        if (!site->ok) {
+            fprintf(stderr, "SSE4A_PATCH skipped site=0x%llx (displaced code is position dependent or a branch target)\n",
+                    (unsigned long long)(uintptr_t)(source_image + site->site));
+            continue;
+        }
+        unsigned char *code = source_image + site->site;
+        unsigned char *slot = pool + used, *p = slot;
+        // The EXTRQ, then the displaced instructions: further EXTRQs are emulated too, the rest
+        // copied as they are (position independent, checked in pass 1).
+        for (uint64_t at = 0; at < site->length;) {
+            unsigned dst, src;
+            const unsigned length = sse4a_extrq_reg(code + at, &dst, &src);
+            ZydisDecodedInstruction ins;
+            if (length) {
+                p = sse4a_emit_extrq(p, dst, src);
+                at += length;
+            } else if (ZYAN_SUCCESS(ZydisDecoderDecodeInstruction(&decoder, NULL, code + at, 15, &ins))) {
+                memcpy(p, code + at, ins.length);
+                p += ins.length;
+                at += ins.length;
+            } else {
+                break;
+            }
+        }
+        const int64_t back = (int64_t)(uintptr_t)(code + site->length) - (int64_t)(uintptr_t)(p + 5);
+        const int64_t there = (int64_t)(uintptr_t)slot - (int64_t)(uintptr_t)(code + 5);
+        if ((uint64_t)(p - slot) + 5 > SSE4A_SLOT_BYTES || back != (int32_t)back || there != (int32_t)there) continue;
+        *p++ = 0xe9;
+        const int32_t back32 = (int32_t)back, there32 = (int32_t)there;
+        memcpy(p, &back32, 4);
+        used += SSE4A_SLOT_BYTES;
+        code[0] = 0xe9;
+        memcpy(code + 1, &there32, 4);
+        for (uint64_t k = 5; k < site->length; ++k) code[k] = 0xcc;
+        patched_end = site->end;
+        ++patched;
+    }
+    FlushInstructionCache(GetCurrentProcess(), NULL, 0);
+    fprintf(stderr, "SSE4A_PATCH sites=%llu patched=%llu (CPU without SSE4a)\n",
+            (unsigned long long)found, (unsigned long long)patched);
 }

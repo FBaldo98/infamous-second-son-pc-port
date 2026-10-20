@@ -1581,10 +1581,19 @@ void TextureCache::GarbageCollectImages() {
         if (num_deletions == 0) {
             return true;
         }
-        if (recent_use && !aggresive && gc_tick >= ticks_to_destroy &&
-            ticks_to_destroy < gc_scheduler_ticks.size() && slot_images.is_allocated(image_id)) {
+        // ISS_GC_CRITICAL_SPARE_TICKS (default 8): the aggressive pass still spares images used
+        // in its last ticks. On 4 GB GPUs memory stays critical, and it deleted images draws
+        // being recorded on the native pass threads still pushed: a destroyed image view in
+        // vkCmdPushDescriptorSetKHR, an access violation inside the driver (2026-10-20).
+        static const u64 critical_spare_ticks = [] {
+            const char* p = std::getenv("ISS_GC_CRITICAL_SPARE_TICKS");
+            return p ? u64(std::strtoull(p, nullptr, 10)) : u64{8};
+        }();
+        const u64 spare_ticks = aggresive ? critical_spare_ticks : ticks_to_destroy;
+        if (recent_use && spare_ticks != 0 && gc_tick >= spare_ticks &&
+            spare_ticks < gc_scheduler_ticks.size() && slot_images.is_allocated(image_id)) {
             const u64 used_since =
-                gc_scheduler_ticks[(gc_tick - ticks_to_destroy) % gc_scheduler_ticks.size()];
+                gc_scheduler_ticks[(gc_tick - spare_ticks) % gc_scheduler_ticks.size()];
             auto& recent = slot_images[image_id];
             if (used_since != 0 && True(recent.flags & ImageFlagBits::Registered) &&
                 recent.tick_accessed_last >= used_since) {

@@ -656,6 +656,26 @@ std::optional<u32> FindMemoryType(const vk::PhysicalDeviceMemoryProperties& prop
     return std::nullopt;
 }
 
+// iss: a memory type of the sparse arena in system memory (a heap that is not device local). When
+// device memory runs out (4 GB laptop GPUs: a single draw can make 2.4 GB resident), residency
+// falls back to it: slower over PCIe, but the game keeps running. ISS_RESIDENCY_SYSMEM=0 off.
+std::optional<u32> residency_sysmem_type;
+
+std::optional<u32> FindSystemMemoryType(const vk::PhysicalDeviceMemoryProperties& properties,
+                                        u32 memory_type_bits) {
+    if (const char* p = std::getenv("ISS_RESIDENCY_SYSMEM"); p && p[0] == '0') {
+        return std::nullopt;
+    }
+    for (u32 i = 0; i < properties.memoryTypeCount; ++i) {
+        const auto heap = properties.memoryTypes[i].heapIndex;
+        if (((memory_type_bits >> i) & 1) != 0 &&
+            !(properties.memoryHeaps[heap].flags & vk::MemoryHeapFlagBits::eDeviceLocal)) {
+            return i;
+        }
+    }
+    return std::nullopt;
+}
+
 BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
                          Vulkan::Runtime& runtime_, AmdGpu::Liverpool* liverpool_,
                          TextureCache& texture_cache_, PageManager& tracker)
@@ -692,6 +712,11 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
         FindMemoryType(instance.GetMemoryProperties(), vk::MemoryPropertyFlagBits::eDeviceLocal,
                        reqs.memoryTypeBits)
             .value();
+    residency_sysmem_type = FindSystemMemoryType(instance.GetMemoryProperties(), reqs.memoryTypeBits);
+    std::fprintf(stderr, "RESIDENCY_TYPES device=%u sysmem=%d type_bits=0x%x block=%llu\n",
+                 arena_memory_type_index,
+                 residency_sysmem_type ? int(*residency_sysmem_type) : -1, reqs.memoryTypeBits,
+                 (unsigned long long)block_size);
 
     const u64 bda_pagetable_size =
         (blocks_per_arena_page * NUM_ARENA_PAGES) * sizeof(vk::DeviceAddress);
@@ -3330,16 +3355,58 @@ struct ResidencyPool {
 };
 ResidencyPool residency_pool;
 
-std::pair<vk::DeviceMemory, u64> AllocateResidency(vk::Device device, u32 type_index, u64 size) {
+// iss: a failed residency allocation reports every memory heap (size, budget, usage) before the
+// assertion, to tell which heap ran out on smaller GPUs (4 GB laptop cards).
+void ReportDeviceMemory(const Vulkan::Instance& instance, u64 bytes, vk::Result result) {
+    vk::PhysicalDeviceMemoryBudgetPropertiesEXT budget{};
+    vk::PhysicalDeviceMemoryProperties2 props{
+        .pNext = instance.CanReportMemoryUsage() ? &budget : nullptr,
+    };
+    instance.GetPhysicalDevice().getMemoryProperties2(&props);
+    const auto& memory = props.memoryProperties;
+    std::fprintf(stderr, "RESIDENCY_ALLOC_FAILED bytes=%llu result=%s chunks=%llu\n",
+                 (unsigned long long)bytes, vk::to_string(result).c_str(),
+                 (unsigned long long)residency_pool.chunks);
+    for (u32 heap = 0; heap < memory.memoryHeapCount; ++heap) {
+        std::fprintf(stderr, "MEMORY_HEAP %u device_local=%d size=%llu MB budget=%llu MB usage=%llu MB\n",
+                     heap,
+                     int(bool(memory.memoryHeaps[heap].flags & vk::MemoryHeapFlagBits::eDeviceLocal)),
+                     (unsigned long long)(memory.memoryHeaps[heap].size >> 20),
+                     (unsigned long long)(budget.heapBudget[heap] >> 20),
+                     (unsigned long long)(budget.heapUsage[heap] >> 20));
+    }
+    std::fflush(stderr);
+}
+
+std::pair<vk::DeviceMemory, u64> AllocateResidency(const Vulkan::Instance& instance, u32 type_index,
+                                                   u64 size) {
     static const bool enabled = [] {
         const char* p = std::getenv("ISS_RESIDENCY_POOL");
         return !p || p[0] != '0';
     }();
-    const auto allocate = [device, type_index](u64 bytes) {
-        return Vulkan::Check(device.allocateMemory(vk::MemoryAllocateInfo{
+    const auto allocate = [&instance, type_index](u64 bytes) {
+        auto memory = instance.GetDevice().allocateMemory(vk::MemoryAllocateInfo{
             .allocationSize = bytes,
             .memoryTypeIndex = type_index,
-        }));
+        });
+        if (memory.result == vk::Result::eErrorOutOfDeviceMemory && residency_sysmem_type) {
+            auto fallback = instance.GetDevice().allocateMemory(vk::MemoryAllocateInfo{
+                .allocationSize = bytes,
+                .memoryTypeIndex = *residency_sysmem_type,
+            });
+            if (fallback.result == vk::Result::eSuccess) {
+                static std::atomic<u64> sysmem_bytes{};
+                const u64 total = sysmem_bytes.fetch_add(bytes) + bytes;
+                std::fprintf(stderr, "RESIDENCY_SYSMEM bytes=%llu total=%llu MB\n",
+                             (unsigned long long)bytes, (unsigned long long)(total >> 20));
+                return fallback.value;
+            }
+            memory.result = fallback.result;
+        }
+        if (memory.result != vk::Result::eSuccess) {
+            ReportDeviceMemory(instance, bytes, memory.result);
+        }
+        return Vulkan::Check(std::move(memory));
     };
     if (!enabled || size > ResidencyPool::ChunkSize / 2) {
         return {allocate(size), 0};
@@ -3399,7 +3466,7 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
     }
 
     const auto [device_memory, memory_base] = AllocateResidency(
-        instance.GetDevice(), arena_memory_type_index, resident_blocks << block_shift);
+        instance, arena_memory_type_index, resident_blocks << block_shift);
 
     boost::container::small_vector<vk::BufferCopy, 8> copies;
     const auto staging =
