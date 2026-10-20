@@ -32,6 +32,17 @@
 
 namespace VideoCore {
 
+// iss: garbage collector ticks a deleted image or collected sampler stays alive before its
+// destruction is scheduled (DeleteImage, GarbageCollectSamplers). ISS_IMAGE_GRAVEYARD_TICKS,
+// default 4; 0 destroys them as before.
+static u64 GraveyardTicks() {
+    static const u64 ticks = [] {
+        const char* p = std::getenv("ISS_IMAGE_GRAVEYARD_TICKS");
+        return p ? u64(std::strtoull(p, nullptr, 10)) : u64{4};
+    }();
+    return ticks;
+}
+
 static constexpr u64 PageShift = 12;
 static constexpr u64 NumFramesBeforeRemoval = 32;
 
@@ -1666,8 +1677,17 @@ void TextureCache::GarbageCollectSamplers() {
             return true;
         }
         --num_deletions;
-        const size_t lru_id = samplers.at(hash).lru_id;
-        samplers.erase(hash);
+        auto it = samplers.find(hash);
+        const size_t lru_id = it->second.lru_id;
+        // iss: the sampler is not destroyed here: draws recorded on the native pass threads may
+        // still push its handle (templates check samplers_generation, on another thread). On
+        // NVIDIA (4000 samplers at most) this collector runs; destroyed samplers pushed into
+        // vkCmdPushDescriptorSetKHR faulted inside the driver (2026-10-20).
+        if (GraveyardTicks() != 0) {
+            std::scoped_lock lk{graveyard_mutex};
+            sampler_graveyard.emplace_back(gc_tick + GraveyardTicks(), std::move(it.value()));
+        }
+        samplers.erase(it);
         sampler_lru_cache.Free(lru_id);
         // Handles remembered outside the cache (Rasterizer sampler memo) are stale.
         samplers_generation.fetch_add(1, std::memory_order_release);
@@ -1691,6 +1711,7 @@ void TextureCache::RunGarbageCollector() {
     };
     gc_scheduler_ticks[gc_tick % gc_scheduler_ticks.size()] = scheduler.CurrentTick();
 
+    ReleaseGraveyard(false);
     GarbageCollectImages();
     GarbageCollectSamplers();
     if (texture_lookup_memo_enabled && texture_lookup_stats_enabled &&
@@ -1780,6 +1801,21 @@ void TextureCache::DeleteImage(ImageId image_id) {
         }
     }
 
+    // iss: the image and its views stay alive for ISS_IMAGE_GRAVEYARD_TICKS (default 4) garbage
+    // collector ticks before their destruction is even scheduled. DeferOperation waits for the
+    // GPU to reach the command processor's current tick, but the native pass threads record
+    // draws into command buffers submitted after it: with the textures deleted all the time on
+    // a 4 GB GPU, they pushed image views already destroyed (use after free inside the NVIDIA
+    // driver, vkCmdPushDescriptorSetKHR, 2026-10-20). 0 restores the immediate scheduling.
+    if (GraveyardTicks() == 0) {
+        ReclaimImage(image_id);
+        return;
+    }
+    std::scoped_lock lk{graveyard_mutex};
+    graveyard.push_back({image_id, gc_tick + GraveyardTicks()});
+}
+
+void TextureCache::ReclaimImage(ImageId image_id) {
     // Reclaim image and any image views it references.
     scheduler.DeferOperation([this, image_id] {
         Image& image = slot_images[image_id];
@@ -1790,6 +1826,29 @@ void TextureCache::DeleteImage(ImageId image_id) {
         }
         slot_images.erase(image_id);
     });
+}
+
+void TextureCache::ReleaseGraveyard(bool all) {
+    std::vector<ImageId> due;
+    auto due_samplers = std::make_shared<std::vector<Sampler>>();
+    {
+        std::scoped_lock lk{graveyard_mutex};
+        while (!graveyard.empty() && (all || graveyard.front().release_tick <= gc_tick)) {
+            due.push_back(graveyard.front().image_id);
+            graveyard.pop_front();
+        }
+        while (!sampler_graveyard.empty() && (all || sampler_graveyard.front().first <= gc_tick)) {
+            due_samplers->push_back(std::move(sampler_graveyard.front().second));
+            sampler_graveyard.pop_front();
+        }
+    }
+    for (const ImageId image_id : due) {
+        ReclaimImage(image_id);
+    }
+    if (!due_samplers->empty()) {
+        // Destroyed once the GPU reached the current tick, like the images.
+        scheduler.DeferOperation([due_samplers] { due_samplers->clear(); });
+    }
 }
 
 } // namespace VideoCore

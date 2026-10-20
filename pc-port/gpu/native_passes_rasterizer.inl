@@ -900,6 +900,60 @@ static void Reset(Rec& r) {
     r.classes = 0;
 }
 
+// iss: the NVIDIA driver faulted inside vkCmdPushDescriptorSetKHR of recorded draws on a 4 GB
+// GPU (nvoglv64.dll+0xeea990, an invalid handle in a descriptor). The push runs under SEH: a
+// fault is reported with every descriptor of the draw, and the draw takes the full path instead
+// of ending the game. Only plain data crosses the __try (no C++ unwinding there).
+static bool GuardedPushDescriptors(VkCommandBuffer cmd, VkPipelineLayout layout, u32 count,
+                                   const VkWriteDescriptorSet* writes) {
+    __try {
+        VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                                               layout, 0, count, writes);
+        return true;
+    } __except (1) {
+        return false;
+    }
+}
+static bool GuardedRead(const void* address, void* out, size_t bytes) {
+    __try {
+        std::memcpy(out, address, bytes);
+        return true;
+    } __except (1) {
+        return false;
+    }
+}
+static void ReportPushFault(u64 vs_hash, u64 fs_hash, const VkWriteDescriptorSet* writes, u32 count) {
+    static std::atomic<u32> faults{};
+    const u32 n = faults.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n > 8 && (n & (n - 1)) != 0) return;
+    std::fprintf(stderr, "PUSH_DESCRIPTOR_FAULT count=%u vs=0x%llx fs=0x%llx writes=%u\n", n,
+                 (unsigned long long)vs_hash, (unsigned long long)fs_hash, count);
+    for (u32 i = 0; i < count && i < 64; ++i) {
+        const auto& w = writes[i];
+        for (u32 e = 0; e < w.descriptorCount && e < 4; ++e) {
+            if (w.pBufferInfo) {
+                VkDescriptorBufferInfo b{};
+                const bool ok = GuardedRead(w.pBufferInfo + e, &b, sizeof(b));
+                std::fprintf(stderr, "  write=%u binding=%u type=%d buffer=0x%llx offset=%llu range=%llu%s\n", i,
+                             w.dstBinding, int(w.descriptorType), (unsigned long long)(uintptr_t)b.buffer,
+                             (unsigned long long)b.offset, (unsigned long long)b.range, ok ? "" : " (unreadable)");
+            } else if (w.pImageInfo) {
+                VkDescriptorImageInfo im{};
+                const bool ok = GuardedRead(w.pImageInfo + e, &im, sizeof(im));
+                std::fprintf(stderr, "  write=%u binding=%u type=%d view=0x%llx sampler=0x%llx layout=%d%s\n", i,
+                             w.dstBinding, int(w.descriptorType), (unsigned long long)(uintptr_t)im.imageView,
+                             (unsigned long long)(uintptr_t)im.sampler, int(im.imageLayout), ok ? "" : " (unreadable)");
+            } else if (w.pTexelBufferView) {
+                std::fprintf(stderr, "  write=%u binding=%u type=%d texel_view_ptr=%p\n", i, w.dstBinding,
+                             int(w.descriptorType), (const void*)w.pTexelBufferView);
+            } else {
+                std::fprintf(stderr, "  write=%u binding=%u type=%d no info\n", i, w.dstBinding, int(w.descriptorType));
+            }
+        }
+    }
+    std::fflush(stderr);
+}
+
 static np::DrawResult Record(np::Segment& s, void* regs_ptr, u64 key, const u32* written,
                              const np::DrawArgs& d) {
     auto& stats = engine_stats;
@@ -1157,14 +1211,25 @@ static np::DrawResult Record(np::Segment& s, void* regs_ptr, u64 key, const u32*
         }
         vk::Buffer handle;
         u64 offset;
-        if (!resolve(sharp.base_address, sharp.GetSize(), handle, offset)) return fail(MissBuffer);
+        // The same capped range the command processor binds (CapReadBufferSize).
+        const u64 bound = CapReadBufferSize(*g.instance, sharp.GetSize(),
+                                            stage.buffers[slot.desc].is_written);
+        if (!resolve(sharp.base_address, bound, handle, offset)) return fail(MissBuffer);
         const u64 aligned = Common::AlignDown(offset, alignment);
         push.buf_offsets[slot.binding] = u8(offset - aligned);
-        info = vk::DescriptorBufferInfo{handle, aligned, sharp.GetSize() + (offset - aligned)};
+        info = vk::DescriptorBufferInfo{handle, aligned, bound + (offset - aligned)};
     }
     NativeMaterial::BuildWrites(*t, infos.data(), writes);
     if (pipeline->UsesPushDescriptors()) {
-        cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, pipeline->GetLayout(), 0, writes);
+        const auto* raw = reinterpret_cast<const VkWriteDescriptorSet*>(writes.data());
+        if (!GuardedPushDescriptors(static_cast<VkCommandBuffer>(cmd),
+                                    static_cast<VkPipelineLayout>(pipeline->GetLayout()),
+                                    u32(writes.size()), raw)) {
+            const auto vs = stages[static_cast<u32>(Shader::SwStage::Vertex)];
+            const auto fs = stages[static_cast<u32>(Shader::SwStage::Fragment)];
+            ReportPushFault(vs ? vs->pgm_hash : 0, fs ? fs->pgm_hash : 0, raw, u32(writes.size()));
+            return fail(MissCommand);
+        }
     } else if (!writes.empty()) {
         const auto set = w->AllocateSet(pipeline->GetDescriptorSetLayout(), seq);
         if (!set) return fail(MissPool);

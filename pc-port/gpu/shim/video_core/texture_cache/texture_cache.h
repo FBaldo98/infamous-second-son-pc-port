@@ -6,6 +6,7 @@
 #include <source_location>
 #include <atomic>
 #include <condition_variable>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -494,6 +495,12 @@ private:
     /// Removes the image and any views/surface metas that reference it.
     void DeleteImage(ImageId image_id);
 
+    /// Destroys a deleted image and its views once the GPU reached the current tick.
+    void ReclaimImage(ImageId image_id);
+
+    /// Hands the deleted images whose graveyard time ended to ReclaimImage.
+    void ReleaseGraveyard(bool all);
+
     /// Touch the image in the LRU cache.
     void TouchImage(const Image& image);
 
@@ -545,6 +552,15 @@ private:
     u64 pressure_gc_samplers = 0;
     u64 critical_gc_samplers = 0;
     u64 gc_tick = 0;
+    /// Deleted images kept alive until a garbage collector tick (DeleteImage, ReleaseGraveyard).
+    struct Grave {
+        ImageId image_id;
+        u64 release_tick;
+    };
+    std::mutex graveyard_mutex;
+    std::deque<Grave> graveyard;
+    /// Collected samplers, kept alive the same way (GarbageCollectSamplers).
+    std::deque<std::pair<u64, Sampler>> sampler_graveyard;
     /// The scheduler tick at each garbage collector tick (by gc_tick % 256): what
     /// Image::tick_accessed_last of an image used since a given gc tick is at least.
     std::array<u64, 256> gc_scheduler_ticks{};
