@@ -11,7 +11,7 @@ if __name__ == '__main__':
     out.mkdir(exist_ok=True)
     ninja = (WORKSPACE / 'build-opt/build.ninja').read_text()
     defs = shlex.split(re.search(r'^  DEFINES = (.+)$', ninja, re.M)[1])
-    includes = shlex.split(re.search(r'^  INCLUDES = (.+)$', ninja, re.M)[1])
+    includes = shlex.split(re.search(r'^  INCLUDES = (.+)$', ninja, re.M)[1].replace('\\', '/'))
     sources = [ROOT / 'tools/gcn_decode.cpp', SOURCE / 'shader_recompiler/frontend/decode.cpp',
                SOURCE / 'shader_recompiler/frontend/format.cpp']
     args = [str(CLANG), '/nologo', '/std:c++latest', '/EHsc', '/MD', '/O2', *defs, *includes,

@@ -10,13 +10,13 @@ import shutil
 import argparse
 
 ROOT = Path(__file__).resolve().parents[1]
-VARS = next((p for p in (Path(r'C:\Program Files\Microsoft Visual Studio\2022')/e/'VC/Auxiliary/Build/vcvars64.bat' for e in ('Community','Professional','Enterprise','BuildTools')) if p.exists()),Path(r'C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat'))
+from vcvars import VARS, ARGS as VARS_ARGS
 CLANG = ROOT.parent / 'tools/llvm/bin/clang-cl.exe'
 
 def build(output=None):
     if not VARS.exists() or not CLANG.exists():
         raise RuntimeError('Requires the existing VS2022 SDK and tools/llvm/bin/clang-cl.exe')
-    result = subprocess.run(f'cmd.exe /d /s /c ""{VARS}" >nul && set"',
+    result = subprocess.run(f'cmd.exe /d /s /c ""{VARS}"{VARS_ARGS} >nul && set"',
                             capture_output=True, text=True, check=True)
     env = os.environ.copy()
     for line in result.stdout.splitlines():
